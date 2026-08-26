@@ -6,7 +6,7 @@ namespace CityModel.Versioning;
 /// </summary>
 public static class CityModelContractVersion
 {
-    public const int SchemaVersion = 1;
+    public const string SchemaVersion = "1.0.0";
     public const string GeneratorVersion = "0.1.0-dev";
     public const int DatabaseUserVersion = 1;
 }

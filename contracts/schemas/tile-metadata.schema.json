@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://azarashin.github.io/CityGMLLite/schemas/tile-metadata.schema.json",
+  "title": "CityGMLLite tile metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "generationId",
+    "tileId",
+    "content",
+    "origin",
+    "coordinateFrame",
+    "tileBounds",
+    "contentBounds",
+    "features",
+    "statistics"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "generationId": { "$ref": "#/$defs/nonEmptyString" },
+    "tileId": { "$ref": "#/$defs/nonEmptyString" },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["glb", "sha256", "byteLength"],
+      "properties": {
+        "glb": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byteLength": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["geographic", "projected"],
+      "properties": {
+        "geographic": { "$ref": "#/$defs/geographicCoordinate" },
+        "projected": { "$ref": "#/$defs/projectedCoordinate" }
+      }
+    },
+    "coordinateFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "handedness", "xAxis", "yAxis", "zAxis", "projectedToLocalMatrix"],
+      "properties": {
+        "unit": { "const": "metre" },
+        "handedness": { "const": "right" },
+        "xAxis": { "const": "east" },
+        "yAxis": { "const": "up" },
+        "zAxis": { "const": "south" },
+        "projectedToLocalMatrix": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 16,
+          "maxItems": 16
+        }
+      }
+    },
+    "tileBounds": { "$ref": "#/$defs/tileBounds" },
+    "contentBounds": { "$ref": "#/$defs/contentBounds" },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic", "componentType", "nullFeatureId", "buildingIds"],
+      "properties": {
+        "semantic": { "const": "_FEATURE_ID_0" },
+        "componentType": { "const": "UNSIGNED_SHORT" },
+        "nullFeatureId": { "const": 65535 },
+        "buildingIds": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonEmptyString" },
+          "maxItems": 65535,
+          "uniqueItems": true
+        },
+        "buildingPartIds": {
+          "type": "array",
+          "items": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["buildingCount", "vertexCount", "triangleCount", "primitiveCount"],
+      "properties": {
+        "buildingCount": { "type": "integer", "minimum": 0 },
+        "vertexCount": { "type": "integer", "minimum": 0 },
+        "triangleCount": { "type": "integer", "minimum": 0 },
+        "primitiveCount": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?![\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$"
+    },
+    "geographicCoordinate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latitude", "longitude", "height", "epsg"],
+      "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "height": { "type": "number" },
+        "epsg": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "projectedCoordinate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z", "epsg"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" },
+        "epsg": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "tileBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minX", "minY", "maxX", "maxY"],
+      "properties": {
+        "minX": { "type": "number" },
+        "minY": { "type": "number" },
+        "maxX": { "type": "number" },
+        "maxY": { "type": "number" }
+      }
+    },
+    "contentBounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minX", "minY", "minZ", "maxX", "maxY", "maxZ"],
+      "properties": {
+        "minX": { "type": "number" },
+        "minY": { "type": "number" },
+        "minZ": { "type": "number" },
+        "maxX": { "type": "number" },
+        "maxY": { "type": "number" },
+        "maxZ": { "type": "number" }
+      }
+    }
+  }
+}

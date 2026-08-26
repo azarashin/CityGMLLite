@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://azarashin.github.io/CityGMLLite/schemas/dataset-manifest.schema.json",
+  "title": "CityGMLLite dataset manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "datasetId",
+    "generationId",
+    "generatedAt",
+    "generator",
+    "source",
+    "coordinateReference",
+    "datasetOrigin",
+    "tiling",
+    "modelProfile",
+    "database",
+    "tiles"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "datasetId": { "$ref": "#/$defs/nonEmptyString" },
+    "generationId": { "$ref": "#/$defs/nonEmptyString" },
+    "generatedAt": { "type": "string", "format": "date-time" },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "$ref": "#/$defs/nonEmptyString" },
+        "version": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "profile", "citygmlVersion", "files"],
+      "properties": {
+        "format": { "const": "CityGML" },
+        "profile": { "$ref": "#/$defs/nonEmptyString" },
+        "citygmlVersion": { "$ref": "#/$defs/nonEmptyString" },
+        "files": { "type": "integer", "minimum": 0 },
+        "inputFiles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": { "$ref": "#/$defs/relativePath" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
+        "conversionConfiguration": { "type": "object" }
+      }
+    },
+    "coordinateReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCrs", "workingCrs", "verticalReference"],
+      "properties": {
+        "sourceCrs": { "$ref": "#/$defs/crs" },
+        "workingCrs": { "$ref": "#/$defs/workingCrs" },
+        "verticalReference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "epsg", "geoidModel"],
+          "properties": {
+            "type": { "$ref": "#/$defs/nonEmptyString" },
+            "epsg": { "type": ["integer", "null"], "minimum": 1 },
+            "geoidModel": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "datasetOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["geographic", "projected"],
+      "properties": {
+        "geographic": { "$ref": "#/$defs/geographicCoordinate" },
+        "projected": { "$ref": "#/$defs/projectedCoordinate" }
+      }
+    },
+    "tiling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "defaultTileSizeMetres", "buildingAssignment", "geometryClipping"],
+      "properties": {
+        "scheme": { "const": "projected-grid" },
+        "defaultTileSizeMetres": { "type": "number", "exclusiveMinimum": 0 },
+        "buildingAssignment": { "const": "representative-point" },
+        "geometryClipping": { "const": false }
+      }
+    },
+    "modelProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lod", "textures", "featureIdSemantic", "featureIdComponentType"],
+      "properties": {
+        "lod": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "textures": { "type": "boolean" },
+        "compression": { "type": ["string", "null"] },
+        "featureIdSemantic": { "const": "_FEATURE_ID_0" },
+        "featureIdComponentType": { "const": "UNSIGNED_SHORT" }
+      }
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "tiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["indexType"],
+      "properties": {
+        "indexType": { "enum": ["inline", "external"] },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tileId", "metadata"],
+            "properties": {
+              "tileId": { "$ref": "#/$defs/nonEmptyString" },
+              "metadata": { "$ref": "#/$defs/relativePath" }
+            }
+          }
+        },
+        "index": { "$ref": "#/$defs/relativePath" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "indexType": { "const": "inline" } } },
+          "then": { "required": ["items"] }
+        },
+        {
+          "if": { "properties": { "indexType": { "const": "external" } } },
+          "then": { "required": ["index"] }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?![\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$"
+    },
+    "axisOrder": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "crs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["axisOrder"],
+      "properties": {
+        "epsg": { "type": ["integer", "null"], "minimum": 1 },
+        "wkt": { "type": ["string", "null"] },
+        "axisOrder": { "$ref": "#/$defs/axisOrder" }
+      },
+      "anyOf": [
+        {
+          "required": ["epsg"],
+          "properties": { "epsg": { "type": "integer", "minimum": 1 } }
+        },
+        {
+          "required": ["wkt"],
+          "properties": { "wkt": { "type": "string", "minLength": 1 } }
+        }
+      ]
+    },
+    "workingCrs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["epsg", "axisOrder", "unit"],
+      "properties": {
+        "epsg": { "type": "integer", "minimum": 1 },
+        "wkt": { "type": ["string", "null"] },
+        "axisOrder": { "$ref": "#/$defs/axisOrder" },
+        "unit": { "const": "metre" }
+      }
+    },
+    "geographicCoordinate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latitude", "longitude", "height", "epsg"],
+      "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "height": { "type": "number" },
+        "epsg": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "projectedCoordinate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z", "epsg"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" },
+        "epsg": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
