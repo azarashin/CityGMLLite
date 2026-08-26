@@ -1,0 +1,82 @@
+{
+  "schemaVersion": "1.0.0",
+  "datasetId": "saitama-shadow-route-2026",
+  "generationId": "01JEXAMPLEGENERATION",
+  "generatedAt": "2026-08-27T06:00:00+09:00",
+  "generator": {
+    "name": "citymodel-converter",
+    "version": "0.1.0-dev"
+  },
+  "source": {
+    "format": "CityGML",
+    "profile": "PLATEAU",
+    "citygmlVersion": "2.0",
+    "files": 42,
+    "inputFiles": [
+      {
+        "path": "udx/bldg/bldg_0001.gml",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "conversionConfiguration": {
+      "lod": 1,
+      "tileSizeMetres": 500
+    }
+  },
+  "coordinateReference": {
+    "sourceCrs": {
+      "epsg": 6697,
+      "axisOrder": ["latitude", "longitude", "height"]
+    },
+    "workingCrs": {
+      "epsg": 6677,
+      "axisOrder": ["easting", "northing", "height"],
+      "unit": "metre"
+    },
+    "verticalReference": {
+      "type": "source-defined",
+      "epsg": null,
+      "geoidModel": null
+    }
+  },
+  "datasetOrigin": {
+    "geographic": {
+      "latitude": 35.8617,
+      "longitude": 139.6455,
+      "height": 0.0,
+      "epsg": 6697
+    },
+    "projected": {
+      "x": 100000.0,
+      "y": 25000.0,
+      "z": 0.0,
+      "epsg": 6677
+    }
+  },
+  "tiling": {
+    "scheme": "projected-grid",
+    "defaultTileSizeMetres": 500.0,
+    "buildingAssignment": "representative-point",
+    "geometryClipping": false
+  },
+  "modelProfile": {
+    "lod": 1,
+    "textures": false,
+    "compression": null,
+    "featureIdSemantic": "_FEATURE_ID_0",
+    "featureIdComponentType": "UNSIGNED_SHORT"
+  },
+  "database": {
+    "path": "citymodel.sqlite",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "tiles": {
+    "indexType": "inline",
+    "items": [
+      {
+        "tileId": "t_000012_000034",
+        "metadata": "tiles/t_000012_000034.meta.json"
+      }
+    ]
+  }
+}

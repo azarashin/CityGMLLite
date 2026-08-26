@@ -1,0 +1,67 @@
+{
+  "schemaVersion": "1.0.0",
+  "generationId": "01JEXAMPLEGENERATION",
+  "tileId": "t_000012_000034",
+  "content": {
+    "glb": "t_000012_000034.glb",
+    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "byteLength": 12345678
+  },
+  "origin": {
+    "geographic": {
+      "latitude": 35.8621,
+      "longitude": 139.6460,
+      "height": 8.2,
+      "epsg": 6697
+    },
+    "projected": {
+      "x": 100250.0,
+      "y": 25250.0,
+      "z": 8.2,
+      "epsg": 6677
+    }
+  },
+  "coordinateFrame": {
+    "unit": "metre",
+    "handedness": "right",
+    "xAxis": "east",
+    "yAxis": "up",
+    "zAxis": "south",
+    "projectedToLocalMatrix": [
+      1.0, 0.0, 0.0, -100250.0,
+      0.0, 0.0, 1.0, -8.2,
+      0.0, -1.0, 0.0, 25250.0,
+      0.0, 0.0, 0.0, 1.0
+    ]
+  },
+  "tileBounds": {
+    "minX": 100000.0,
+    "minY": 25000.0,
+    "maxX": 100500.0,
+    "maxY": 25500.0
+  },
+  "contentBounds": {
+    "minX": 99982.5,
+    "minY": 24995.2,
+    "minZ": 5.1,
+    "maxX": 100510.8,
+    "maxY": 25508.7,
+    "maxZ": 96.4
+  },
+  "features": {
+    "semantic": "_FEATURE_ID_0",
+    "componentType": "UNSIGNED_SHORT",
+    "nullFeatureId": 65535,
+    "buildingIds": [
+      "01100-bldg-000001",
+      "01100-bldg-000002",
+      "01100-bldg-000003"
+    ]
+  },
+  "statistics": {
+    "buildingCount": 3,
+    "vertexCount": 642,
+    "triangleCount": 980,
+    "primitiveCount": 1
+  }
+}

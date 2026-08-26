@@ -27,3 +27,9 @@ The Unity package can be added from disk by selecting
 This is the repository skeleton for GitHub issue #4. It defines module boundaries
 only; CityGML parsing, geometry conversion, GLB writing, database integration, and
 Unity runtime behavior are implemented by their dedicated MVP issues.
+
+## Data contracts
+
+Issue #1 defines JSON Schemas, SQLite/SpatiaLite migration SQL, and the contract
+version policy under `contracts/`. The schemas are validated against fixture
+datasets by the Rust test suite.
