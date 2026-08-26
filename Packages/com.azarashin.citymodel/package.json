@@ -1,0 +1,16 @@
+{
+  "name": "com.azarashin.citymodel",
+  "version": "0.1.0",
+  "displayName": "CityModel Runtime",
+  "description": "Runtime package for CityGMLLite datasets generated as GLB, metadata, and SpatiaLite.",
+  "unity": "6000.0",
+  "keywords": [
+    "citygml",
+    "plateau",
+    "geospatial",
+    "gltf"
+  ],
+  "author": {
+    "name": "CityGMLLite Contributors"
+  }
+}
