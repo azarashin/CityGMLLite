@@ -1,0 +1,31 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace
+
+  unity-package-layout:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate package JSON
+        shell: pwsh
+        run: |
+          Get-ChildItem Packages -Recurse -Include package.json,*.asmdef |
+            ForEach-Object { Get-Content -Raw $_ | ConvertFrom-Json | Out-Null }

@@ -1,0 +1,23 @@
+[package]
+name = "citymodel-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "citymodel"
+path = "src/main.rs"
+
+[dependencies]
+citymodel-citygml = { path = "../citymodel-citygml" }
+citymodel-coordinate = { path = "../citymodel-coordinate" }
+citymodel-geometry = { path = "../citymodel-geometry" }
+citymodel-gltf = { path = "../citymodel-gltf" }
+citymodel-spatialite = { path = "../citymodel-spatialite" }
+citymodel-tiling = { path = "../citymodel-tiling" }
+citymodel-validation = { path = "../citymodel-validation" }
+
+[lints]
+workspace = true

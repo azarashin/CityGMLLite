@@ -1,0 +1,13 @@
+[package]
+name = "citymodel-gltf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+citymodel-core = { path = "../citymodel-core" }
+
+[lints]
+workspace = true
