@@ -16,7 +16,7 @@ and SQLite + SpatiaLite for use by a Unity runtime package.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo run -p citymodel-cli
+cargo run -p citymodel-cli -- inspect path/to/input.gml
 ```
 
 The Unity package can be added from disk by selecting
@@ -24,9 +24,9 @@ The Unity package can be added from disk by selecting
 
 ## Current status
 
-This is the repository skeleton for GitHub issue #4. It defines module boundaries
-only; CityGML parsing, geometry conversion, GLB writing, database integration, and
-Unity runtime behavior are implemented by their dedicated MVP issues.
+The MVP modules now provide CityGML streaming, geometry and tile processing, GLB
+writing, SQLite output, and Unity runtime boundaries. See `docs/` for operation
+guides and the currently known limitations.
 
 ## Data contracts
 
