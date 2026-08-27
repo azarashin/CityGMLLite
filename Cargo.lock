@@ -178,6 +178,7 @@ name = "citymodel-validation"
 version = "0.1.0"
 dependencies = [
  "citymodel-core",
+ "citymodel-gltf",
 ]
 
 [[package]]
