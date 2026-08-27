@@ -12,5 +12,12 @@
   ],
   "author": {
     "name": "CityGMLLite Contributors"
-  }
+  },
+  "samples": [
+    {
+      "displayName": "Quick Start",
+      "description": "Minimal scene that opens a generated CityGMLLite dataset.",
+      "path": "Samples~/Quick Start"
+    }
+  ]
 }
