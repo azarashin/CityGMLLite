@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 citymodel-core = { path = "../citymodel-core" }
+citymodel-coordinate = { path = "../citymodel-coordinate" }
 
 [lints]
 workspace = true
