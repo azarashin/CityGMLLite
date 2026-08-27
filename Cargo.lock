@@ -121,6 +121,7 @@ dependencies = [
  "citymodel-spatialite",
  "citymodel-tiling",
  "citymodel-validation",
+ "serde_json",
 ]
 
 [[package]]

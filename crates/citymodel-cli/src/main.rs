@@ -1,4 +1,7 @@
-//! Placeholder command-line entry point for the `CityGML` converter.
+//! Command-line entry point for the `CityGML` converter.
+
+#[allow(dead_code)]
+mod metadata;
 
 fn main() {
     let modules = [

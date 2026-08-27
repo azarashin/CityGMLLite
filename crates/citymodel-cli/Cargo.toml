@@ -18,6 +18,7 @@ citymodel-gltf = { path = "../citymodel-gltf" }
 citymodel-spatialite = { path = "../citymodel-spatialite" }
 citymodel-tiling = { path = "../citymodel-tiling" }
 citymodel-validation = { path = "../citymodel-validation" }
+serde_json = "1"
 
 [lints]
 workspace = true
