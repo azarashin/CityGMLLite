@@ -14,6 +14,37 @@ namespace CityModel.Loading
         public string schemaVersion;
         public string datasetId;
         public string generationId;
+        public ProjectedOrigin datasetOrigin;
+        public ManifestTiles tiles;
+    }
+
+    [Serializable]
+    public sealed class ProjectedOrigin
+    {
+        public ProjectedCoordinate projected;
+    }
+
+    [Serializable]
+    public sealed class ProjectedCoordinate
+    {
+        public double x;
+        public double y;
+        public double z;
+        public int epsg;
+    }
+
+    [Serializable]
+    public sealed class ManifestTiles
+    {
+        public string indexType;
+        public ManifestTile[] items;
+    }
+
+    [Serializable]
+    public sealed class ManifestTile
+    {
+        public string tileId;
+        public string metadata;
     }
 
     [Serializable]
@@ -30,6 +61,20 @@ namespace CityModel.Loading
         public string generationId;
         public string tileId;
         public TileContent content;
+        public ProjectedOrigin origin;
+    }
+
+    /// <summary>Validated tile metadata and the corresponding GLB bytes.</summary>
+    public sealed class LoadedTile
+    {
+        public LoadedTile(TileMetadata metadata, byte[] glbBytes)
+        {
+            Metadata = metadata;
+            GlbBytes = glbBytes;
+        }
+
+        public TileMetadata Metadata { get; }
+        public byte[] GlbBytes { get; }
     }
 
     /// <summary>Owns asynchronous opening, validation, and cleanup of one generated dataset.</summary>
@@ -55,10 +100,19 @@ namespace CityModel.Loading
             var manifest = JsonUtility.FromJson<DatasetManifest>(json) ?? throw new InvalidDataException("Manifest cannot be parsed.");
             if (manifest.schemaVersion != CityModelContractVersion.SchemaVersion || string.IsNullOrWhiteSpace(manifest.generationId))
                 throw new InvalidDataException("Manifest schemaVersion or generationId is invalid.");
+            if (manifest.tiles == null || manifest.tiles.indexType != "inline" || manifest.tiles.items == null)
+                throw new InvalidDataException("Only manifests with an inline tile index are supported.");
             return new CityModelDataset(rootDirectory, manifest, maxConcurrentLoads);
         }
 
-        public async Task<byte[]> LoadGlbAsync(string metadataRelativePath, CancellationToken cancellationToken)
+        public async Task<LoadedTile> LoadTileAsync(ManifestTile tile, CancellationToken cancellationToken)
+        {
+            if (tile == null || string.IsNullOrWhiteSpace(tile.metadata))
+                throw new InvalidDataException("Tile metadata path is missing.");
+            return await LoadTileFromMetadataAsync(tile.metadata, tile.tileId, cancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task<LoadedTile> LoadTileFromMetadataAsync(string metadataRelativePath, string expectedTileId, CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
             await _loadGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -67,14 +121,25 @@ namespace CityModel.Loading
                 var metadataPath = ResolveRelativePath(metadataRelativePath);
                 var metadataJson = await File.ReadAllTextAsync(metadataPath, cancellationToken).ConfigureAwait(false);
                 var metadata = JsonUtility.FromJson<TileMetadata>(metadataJson) ?? throw new InvalidDataException("Tile metadata cannot be parsed.");
-                if (metadata.generationId != Manifest.generationId)
-                    throw new InvalidDataException("Tile generationId does not match the manifest.");
-                var bytes = await File.ReadAllBytesAsync(ResolveRelativePath(metadata.content.glb), cancellationToken).ConfigureAwait(false);
+                if (metadata.schemaVersion != CityModelContractVersion.SchemaVersion || metadata.generationId != Manifest.generationId || (!string.IsNullOrEmpty(expectedTileId) && metadata.tileId != expectedTileId))
+                    throw new InvalidDataException("Tile metadata does not match the dataset manifest.");
+                if (metadata.content == null || string.IsNullOrWhiteSpace(metadata.content.glb) || string.IsNullOrWhiteSpace(metadata.content.sha256))
+                    throw new InvalidDataException("Tile content is incomplete.");
+
+                // The dataset contract stores content.glb relative to the dataset root,
+                // rather than relative to the tile metadata file.
+                var glbPath = ResolveRelativePath(metadata.content.glb);
+                var bytes = await File.ReadAllBytesAsync(glbPath, cancellationToken).ConfigureAwait(false);
                 if (!string.Equals(ToSha256(bytes), metadata.content.sha256, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("GLB SHA-256 does not match tile metadata.");
-                return bytes;
+                return new LoadedTile(metadata, bytes);
             }
             finally { _loadGate.Release(); }
+        }
+
+        public async Task<byte[]> LoadGlbAsync(string metadataRelativePath, CancellationToken cancellationToken)
+        {
+            return (await LoadTileFromMetadataAsync(metadataRelativePath, null, cancellationToken).ConfigureAwait(false)).GlbBytes;
         }
 
         public void Dispose() { if (!_disposed) { _loadGate.Dispose(); _disposed = true; } }

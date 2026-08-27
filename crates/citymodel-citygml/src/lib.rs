@@ -83,6 +83,8 @@ pub struct CoordinateSequence {
     pub srs_name: Option<String>,
     pub axis_order: AxisOrder,
     pub is_linear_ring: bool,
+    /// The `CityGML` `lodN*` ancestor that owns this coordinate sequence, when present.
+    pub lod: Option<u8>,
 }
 
 /// A parser event consumed by normalization and CRS stages.
@@ -319,6 +321,7 @@ struct ElementContext {
     srs_name: Option<String>,
     dimension: Option<u8>,
     inside_linear_ring: bool,
+    lod: Option<u8>,
     depth: usize,
     xlink_href: Option<String>,
     gml_id: Option<String>,
@@ -428,6 +431,7 @@ fn element_context(
         srs_name: parent.srs_name.clone(),
         dimension: parent.dimension,
         inside_linear_ring: parent.inside_linear_ring || is_gml(name, "LinearRing"),
+        lod: lod_from_element_name(&name.local_name).or(parent.lod),
         depth,
         ..ElementContext::default()
     };
@@ -560,7 +564,17 @@ fn emit_coordinates(pending: PendingCoordinates, report: &mut ParseReport, limit
             srs_name: pending.context.srs_name.clone(),
             axis_order: axis_order(pending.context.srs_name.as_deref()),
             is_linear_ring: pending.context.inside_linear_ring,
+            lod: pending.context.lod,
         }));
+}
+
+fn lod_from_element_name(name: &str) -> Option<u8> {
+    let suffix = name.strip_prefix("lod")?;
+    suffix
+        .chars()
+        .next()?
+        .to_digit(10)
+        .and_then(|value| u8::try_from(value).ok())
 }
 
 fn axis_order(srs_name: Option<&str>) -> AxisOrder {
