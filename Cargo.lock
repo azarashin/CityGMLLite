@@ -151,7 +151,10 @@ dependencies = [
 name = "citymodel-gltf"
 version = "0.1.0"
 dependencies = [
+ "citymodel-coordinate",
  "citymodel-core",
+ "citymodel-geometry",
+ "sha2",
 ]
 
 [[package]]
