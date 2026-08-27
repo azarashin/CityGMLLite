@@ -8,6 +8,11 @@ repository.workspace = true
 
 [dependencies]
 citymodel-core = { path = "../citymodel-core" }
+citymodel-geometry = { path = "../citymodel-geometry" }
+sha2 = "0.11"
+
+[dev-dependencies]
+citymodel-coordinate = { path = "../citymodel-coordinate" }
 
 [lints]
 workspace = true
