@@ -163,6 +163,7 @@ name = "citymodel-spatialite"
 version = "0.1.0"
 dependencies = [
  "citymodel-core",
+ "rusqlite",
 ]
 
 [[package]]
