@@ -9,3 +9,9 @@
 .vs/
 *.csproj
 *.sln
+UnityProject/[Ll]ibrary/
+UnityProject/[Tt]emp/
+UnityProject/[Oo]bj/
+UnityProject/[Ll]ogs/
+UnityProject/[Uu]ser[Ss]ettings/
+UnityProject/Packages/packages-lock.json
