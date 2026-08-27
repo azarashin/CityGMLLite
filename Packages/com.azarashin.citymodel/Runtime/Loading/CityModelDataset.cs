@@ -3,6 +3,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using CityModel.Versioning;
 using UnityEngine;
 
 namespace CityModel.Loading
