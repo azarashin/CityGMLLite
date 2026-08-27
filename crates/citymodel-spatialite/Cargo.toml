@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 citymodel-core = { path = "../citymodel-core" }
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [lints]
 workspace = true
