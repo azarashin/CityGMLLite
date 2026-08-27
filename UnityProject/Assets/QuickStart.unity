@@ -37,6 +37,6 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 7ec5201c6cbe4f9f9a659a3971e94a18, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  datasetRoot: 
+  m_Name:
+  m_EditorClassIdentifier:
+  datasetRoot:
