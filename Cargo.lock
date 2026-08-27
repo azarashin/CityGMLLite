@@ -121,7 +121,9 @@ dependencies = [
  "citymodel-spatialite",
  "citymodel-tiling",
  "citymodel-validation",
+ "rusqlite",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

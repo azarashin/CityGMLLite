@@ -18,6 +18,8 @@ pub struct TileMetadataInput<'a> {
     pub projected_origin: [f64; 3],
     pub geographic_origin: [f64; 3],
     pub working_epsg: u32,
+    pub vertex_count: usize,
+    pub triangle_count: usize,
 }
 
 /// Fails closed when a metadata path can escape its dataset root.
@@ -47,7 +49,7 @@ pub fn tile_metadata_json(input: &TileMetadataInput<'_>) -> Value {
         "tileBounds":{"minX":input.tile_bounds[0],"minY":input.tile_bounds[1],"maxX":input.tile_bounds[2],"maxY":input.tile_bounds[3]},
         "contentBounds":{"minX":input.content_bounds[0],"minY":input.content_bounds[1],"minZ":input.content_bounds[2],"maxX":input.content_bounds[3],"maxY":input.content_bounds[4],"maxZ":input.content_bounds[5]},
         "features":{"semantic":"_FEATURE_ID_0","componentType":"UNSIGNED_SHORT","nullFeatureId":65535,"buildingIds":input.building_ids},
-        "statistics":{"buildingCount":input.building_ids.len(),"vertexCount":0,"triangleCount":0,"primitiveCount":1}
+        "statistics":{"buildingCount":input.building_ids.len(),"vertexCount":input.vertex_count,"triangleCount":input.triangle_count,"primitiveCount":1}
     })
 }
 

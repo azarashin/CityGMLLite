@@ -19,7 +19,7 @@ namespace CityModel
             catch { dataset?.Dispose(); throw; }
         }
         public Task CloseAsync() { Dispose(); return Task.CompletedTask; }
-        public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        public ValueTask DisposeAsync() { Dispose(); return new ValueTask(Task.CompletedTask); }
         public void Dispose() { if (Interlocked.Exchange(ref _closed, 1) == 0) { _dataset?.Dispose(); _dataset = null; } }
     }
 }
