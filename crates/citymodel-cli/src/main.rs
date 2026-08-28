@@ -3,7 +3,10 @@
 #[allow(dead_code)]
 mod metadata;
 
-use citymodel_citygml::{AxisOrder, InputLimits, ParserEvent, discover_input_files, parse_file};
+use citymodel_citygml::{
+    AttributeValue, AxisOrder, BuildingAttribute, Diagnostic, InputLimits, ParserEvent,
+    discover_input_files, parse_file,
+};
 use citymodel_coordinate::Point3;
 use citymodel_geometry::{Lod, Polygon, normalize_building_geometry};
 use citymodel_gltf::{TileGlbInput, write_tile_glb};
@@ -39,6 +42,7 @@ struct Command {
 struct RawBuilding {
     id: String,
     rings: Vec<RawRing>,
+    attributes: Vec<BuildingAttribute>,
     source_file_id: i64,
 }
 #[derive(Clone, Debug)]
@@ -53,6 +57,7 @@ struct PreparedBuilding {
     source_file_id: i64,
     triangles: Vec<citymodel_geometry::Triangle>,
     centroid: Point3,
+    attributes: Vec<BuildingAttribute>,
 }
 #[derive(Clone, Debug)]
 struct TileOutput {
@@ -68,7 +73,21 @@ struct TileOutput {
     triangle_count: usize,
 }
 
-type BuildingAssignment = (String, String, i64, u16, Point3);
+#[derive(Clone, Debug)]
+struct BuildingAssignment {
+    building_id: String,
+    tile_id: String,
+    source_file_id: i64,
+    feature_id: u16,
+    centroid: Point3,
+    attributes: Vec<BuildingAttribute>,
+}
+
+#[derive(Clone, Debug)]
+struct ConversionIssue {
+    source_file_id: i64,
+    diagnostic: Diagnostic,
+}
 
 fn main() -> ExitCode {
     match parse_command(env::args().skip(1)) {
@@ -181,6 +200,7 @@ fn convert(input: &Path, output: &Path, mode: Mode) -> Result<(), Box<dyn std::e
     let generation_id = format!("gen-{}", &combined_digest(&files)[..16]);
     let mut buildings = Vec::new();
     let mut source_files = Vec::new();
+    let mut issues = Vec::new();
     for (index, file) in files.iter().enumerate() {
         let source_file_id = i64::try_from(index + 1).map_err(|_| "too many input files")?;
         let report = parse_file(file.clone(), InputLimits::default());
@@ -191,6 +211,18 @@ fn convert(input: &Path, output: &Path, mode: Mode) -> Result<(), Box<dyn std::e
                 report.diagnostics.len()
             )
             .into());
+        }
+        if mode == Mode::Tolerant {
+            issues.extend(
+                report
+                    .diagnostics
+                    .iter()
+                    .cloned()
+                    .map(|diagnostic| ConversionIssue {
+                        source_file_id,
+                        diagnostic,
+                    }),
+            );
         }
         source_files.push((
             source_file_id,
@@ -218,6 +250,7 @@ fn convert(input: &Path, output: &Path, mode: Mode) -> Result<(), Box<dyn std::e
         &source_files,
         &tile_outputs,
         &assignments,
+        &issues,
         origin,
     )?;
     let database_sha256 = sha256_file(&database_path)?;
@@ -245,6 +278,7 @@ fn extract_buildings(events: &[ParserEvent], source_file_id: i64) -> Vec<RawBuil
         id: String,
         is_part: bool,
         rings: Vec<RawRing>,
+        attributes: Vec<BuildingAttribute>,
     }
     let mut active = Vec::<Active>::new();
     let mut output = Vec::new();
@@ -257,6 +291,7 @@ fn extract_buildings(events: &[ParserEvent], source_file_id: i64) -> Vec<RawBuil
                 id: gml_id.clone(),
                 is_part: *is_building_part,
                 rings: Vec::new(),
+                attributes: Vec::new(),
             }),
             ParserEvent::Coordinates(sequence)
                 if sequence.is_linear_ring && sequence.lod == Some(1) =>
@@ -269,12 +304,18 @@ fn extract_buildings(events: &[ParserEvent], source_file_id: i64) -> Vec<RawBuil
                     });
                 }
             }
+            ParserEvent::BuildingAttribute(attribute) => {
+                if let Some(building) = active.iter_mut().rev().find(|item| !item.is_part) {
+                    building.attributes.push(attribute.clone());
+                }
+            }
             ParserEvent::EndFeature => {
                 if let Some(building) = active.pop() {
                     if !building.is_part {
                         output.push(RawBuilding {
                             id: building.id,
                             rings: building.rings,
+                            attributes: building.attributes,
                             source_file_id,
                         });
                     }
@@ -321,6 +362,7 @@ fn prepare_buildings(
             source_file_id: building.source_file_id,
             triangles: geometry.triangles,
             centroid,
+            attributes: building.attributes,
         });
     }
     Ok(output)
@@ -401,13 +443,14 @@ fn write_tiles(
         ];
         for building in &buildings {
             let feature = *feature_ids.get(&building.id).ok_or("missing feature id")?;
-            assignments.push((
-                building.id.clone(),
-                id.clone(),
-                building.source_file_id,
-                feature,
-                building.centroid,
-            ));
+            assignments.push(BuildingAssignment {
+                building_id: building.id.clone(),
+                tile_id: id.clone(),
+                source_file_id: building.source_file_id,
+                feature_id: feature,
+                centroid: building.centroid,
+                attributes: building.attributes.clone(),
+            });
             for triangle in &building.triangles {
                 let mut local = triangle.clone();
                 for point in &mut local.positions {
@@ -480,7 +523,7 @@ fn write_tiles(
     Ok((outputs, assignments))
 }
 
-#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_wrap, clippy::too_many_arguments)]
 fn write_database(
     path: &Path,
     dataset_id: &str,
@@ -488,6 +531,7 @@ fn write_database(
     source_files: &[(i64, PathBuf, String, u64)],
     tiles: &[TileOutput],
     assignments: &[BuildingAssignment],
+    issues: &[ConversionIssue],
     origin: Point3,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let connection = create_database(path)?;
@@ -500,24 +544,80 @@ fn write_database(
     for tile in tiles {
         connection.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.0, 0.0, 0.0, 4326, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, '[]', ?21, 0, ?22, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.building_ids.len() as i64, tile.triangle_count as i64])?;
     }
-    for (building_id, tile_id, source_file_id, feature_id, centroid) in assignments {
-        let canonical = format!("{dataset_id}::{building_id}");
+    for assignment in assignments {
+        let canonical = format!("{dataset_id}::{}", assignment.building_id);
         insert_building(
             &connection,
             &BuildingRow {
-                building_id,
+                building_id: &assignment.building_id,
                 canonical_building_id: &canonical,
-                gml_id: Some(building_id),
-                source_file_id: *source_file_id,
+                gml_id: Some(&assignment.building_id),
+                source_file_id: assignment.source_file_id,
                 id_source: "gml",
                 id_is_synthetic: false,
             },
         )?;
-        connection.execute("UPDATE buildings SET tile_id=?1, local_feature_id=?2, centroid_x=?3, centroid_y=?4 WHERE building_id=?5", params![tile_id, i64::from(*feature_id), centroid.x, centroid.y, building_id])?;
-        connection.execute("INSERT INTO tile_features (tile_id, local_feature_id, building_id, building_part_id) VALUES (?1, ?2, ?3, NULL)", params![tile_id, i64::from(*feature_id), building_id])?;
+        let attributes_json = attributes_json(&assignment.attributes);
+        connection.execute("UPDATE buildings SET tile_id=?1, local_feature_id=?2, centroid_x=?3, centroid_y=?4, attributes_json=?5 WHERE building_id=?6", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.centroid.x, assignment.centroid.y, attributes_json, assignment.building_id])?;
+        connection.execute("INSERT INTO tile_features (tile_id, local_feature_id, building_id, building_part_id) VALUES (?1, ?2, ?3, NULL)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
+        insert_attributes(&connection, &assignment.building_id, &assignment.attributes)?;
+    }
+    for issue in issues {
+        connection.execute(
+            "INSERT INTO conversion_issues (source_file_id, building_id, gml_id, severity, error_code, message, element_path, repaired, exclusion_reason, occurred_at) VALUES (?1, NULL, NULL, 'warn', ?2, ?3, NULL, 0, NULL, '1970-01-01T00:00:00Z')",
+            params![issue.source_file_id, format!("{:?}", issue.diagnostic.kind), issue.diagnostic.message],
+        )?;
     }
     verify_integrity(&connection)?;
     Ok(())
+}
+
+fn insert_attributes(
+    connection: &rusqlite::Connection,
+    building_id: &str,
+    attributes: &[BuildingAttribute],
+) -> rusqlite::Result<()> {
+    let mut ordinals = BTreeMap::<(String, String), i64>::new();
+    for attribute in attributes {
+        let key = (
+            attribute.namespace_uri.clone(),
+            attribute.attribute_path.clone(),
+        );
+        let ordinal = ordinals.entry(key).or_insert(0);
+        let (value_type, value_text, value_real) = match &attribute.value {
+            AttributeValue::Code(value) => ("code", Some(value.as_str()), None),
+            AttributeValue::Real(value) => ("real", None, Some(*value)),
+        };
+        connection.execute(
+            "INSERT INTO building_attributes (building_id, namespace_uri, attribute_path, attribute_key, ordinal, value_type, value_text, value_real, value_integer, value_boolean, value_datetime, uom, code_space, nil_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11)",
+            params![building_id, attribute.namespace_uri, attribute.attribute_path, attribute.attribute_key, *ordinal, value_type, value_text, value_real, attribute.uom, attribute.code_space, attribute.nil_reason],
+        )?;
+        *ordinal += 1;
+    }
+    Ok(())
+}
+
+fn attributes_json(attributes: &[BuildingAttribute]) -> String {
+    let values = attributes
+        .iter()
+        .map(|attribute| {
+            let (value_type, value) = match &attribute.value {
+                AttributeValue::Code(value) => ("code", json!(value)),
+                AttributeValue::Real(value) => ("real", json!(value)),
+            };
+            json!({
+                "namespaceUri": attribute.namespace_uri,
+                "attributePath": attribute.attribute_path,
+                "attributeKey": attribute.attribute_key,
+                "valueType": value_type,
+                "value": value,
+                "uom": attribute.uom,
+                "codeSpace": attribute.code_space,
+                "nilReason": attribute.nil_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&values).expect("attribute JSON serialization cannot fail")
 }
 
 fn write_manifest(
@@ -613,6 +713,15 @@ fn atomic_output_handoff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type StoredAttribute = (
+        String,
+        String,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+    );
     #[test]
     fn parses_inspect_and_tolerant_convert() {
         assert_eq!(
@@ -660,6 +769,91 @@ mod tests {
         let glb = fs::read(output.join(tile["content"]["glb"].as_str().unwrap())).unwrap();
         assert_eq!(&glb[..4], b"glTF");
         assert!(output.join("citymodel.sqlite").is_file());
+        let database = rusqlite::Connection::open(output.join("citymodel.sqlite")).unwrap();
+        let attributes: Vec<StoredAttribute> = database
+            .prepare("SELECT attribute_key, value_type, value_text, value_real, uom, code_space FROM building_attributes ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            attributes,
+            vec![
+                (
+                    "usage".to_owned(),
+                    "code".to_owned(),
+                    Some("residential".to_owned()),
+                    None,
+                    None,
+                    Some("https://example.test/usage".to_owned())
+                ),
+                (
+                    "measuredHeight".to_owned(),
+                    "real".to_owned(),
+                    None,
+                    Some(12.5),
+                    Some("m".to_owned()),
+                    None
+                ),
+            ]
+        );
+        let attributes_json: String = database
+            .query_row(
+                "SELECT attributes_json FROM buildings WHERE building_id = 'sample-building-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&attributes_json).unwrap()[0]["namespaceUri"],
+            "http://www.opengis.net/citygml/building/2.0"
+        );
+        drop(database);
         fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn tolerant_conversion_records_invalid_attribute_diagnostics() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../citymodel-citygml/tests/fixtures/plateau-lod1-small.gml");
+        let input = std::env::temp_dir().join(format!(
+            "citymodel-cli-invalid-attribute-{}.gml",
+            std::process::id()
+        ));
+        fs::write(
+            &input,
+            fs::read_to_string(&fixture)
+                .unwrap()
+                .replace(">12.5</b:measuredHeight>", ">high</b:measuredHeight>"),
+        )
+        .unwrap();
+        let strict_output = std::env::temp_dir().join(format!(
+            "citymodel-cli-invalid-attribute-strict-{}",
+            std::process::id()
+        ));
+        let tolerant_output = std::env::temp_dir().join(format!(
+            "citymodel-cli-invalid-attribute-tolerant-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&strict_output);
+        let _ = fs::remove_dir_all(&tolerant_output);
+        assert!(convert(&input, &strict_output, Mode::Strict).is_err());
+        fs::create_dir_all(&tolerant_output).unwrap();
+        convert(&input, &tolerant_output, Mode::Tolerant).unwrap();
+        let database =
+            rusqlite::Connection::open(tolerant_output.join("citymodel.sqlite")).unwrap();
+        let issue: (String, String) = database
+            .query_row(
+                "SELECT error_code, message FROM conversion_issues",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(issue.0, "InvalidAttribute");
+        assert!(issue.1.contains("measuredHeight"));
+        drop(database);
+        fs::remove_file(input).unwrap();
+        fs::remove_dir_all(tolerant_output).unwrap();
     }
 }

@@ -2,6 +2,8 @@
 <core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0" xmlns:b="http://www.opengis.net/citygml/building/2.0" xmlns:g="http://www.opengis.net/gml">
   <core:cityObjectMember>
     <b:Building g:id="sample-building-1">
+      <b:usage codeSpace="https://example.test/usage">residential</b:usage>
+      <b:measuredHeight uom="m">12.5</b:measuredHeight>
       <b:lod1Solid>
         <g:Solid srsName="urn:ogc:def:crs:EPSG::6697" srsDimension="3">
           <g:exterior><g:CompositeSurface><g:surfaceMember><g:Polygon><g:exterior><g:LinearRing>

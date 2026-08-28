@@ -87,6 +87,25 @@ pub struct CoordinateSequence {
     pub lod: Option<u8>,
 }
 
+/// A typed scalar value declared on a `bldg:Building`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AttributeValue {
+    Code(String),
+    Real(f64),
+}
+
+/// A namespace-qualified Building attribute emitted from the source document.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuildingAttribute {
+    pub namespace_uri: String,
+    pub attribute_path: String,
+    pub attribute_key: String,
+    pub value: AttributeValue,
+    pub uom: Option<String>,
+    pub code_space: Option<String>,
+    pub nil_reason: Option<String>,
+}
+
 /// A parser event consumed by normalization and CRS stages.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParserEvent {
@@ -96,6 +115,7 @@ pub enum ParserEvent {
     },
     EndFeature,
     Coordinates(CoordinateSequence),
+    BuildingAttribute(BuildingAttribute),
     /// Same-file `XLink`. `target_id` is populated for `href="#..."`.
     XLink {
         href: String,
@@ -120,6 +140,7 @@ pub enum DiagnosticKind {
     MissingId,
     UnsupportedElement,
     InvalidCoordinate,
+    InvalidAttribute,
     UnresolvedXLink,
     UnsafeArchivePath,
     Io,
@@ -172,6 +193,7 @@ pub fn parse_file(input: InputFile, limits: InputLimits) -> ParseReport {
     let mut buffer = Vec::new();
     let mut contexts: Vec<ElementContext> = Vec::new();
     let mut coordinate: Option<PendingCoordinates> = None;
+    let mut attribute: Option<PendingAttribute> = None;
     let mut feature_depths = BTreeSet::new();
     let mut known_gml_ids = BTreeSet::new();
 
@@ -209,7 +231,13 @@ pub fn parse_file(input: InputFile, limits: InputLimits) -> ParseReport {
                 if let Some(gml_id) = &context.gml_id {
                     known_gml_ids.insert(gml_id.clone());
                 }
-                handle_start(&context, &mut report, &mut coordinate, &mut feature_depths);
+                handle_start(
+                    &context,
+                    &mut report,
+                    &mut coordinate,
+                    &mut attribute,
+                    &mut feature_depths,
+                );
                 contexts.push(context);
             }
             Event::Empty(start) => {
@@ -222,11 +250,18 @@ pub fn parse_file(input: InputFile, limits: InputLimits) -> ParseReport {
                 if let Some(gml_id) = &context.gml_id {
                     known_gml_ids.insert(gml_id.clone());
                 }
-                handle_start(&context, &mut report, &mut coordinate, &mut feature_depths);
+                handle_start(
+                    &context,
+                    &mut report,
+                    &mut coordinate,
+                    &mut attribute,
+                    &mut feature_depths,
+                );
                 handle_end(
                     &context,
                     &mut report,
                     &mut coordinate,
+                    &mut attribute,
                     &mut feature_depths,
                     limits,
                 );
@@ -245,6 +280,9 @@ pub fn parse_file(input: InputFile, limits: InputLimits) -> ParseReport {
                         });
                     }
                 }
+                if let Some(pending) = &mut attribute {
+                    pending.text.push_str(text.as_ref());
+                }
             }
             Event::CData(text) => {
                 if let Some(pending) = &mut coordinate {
@@ -260,6 +298,9 @@ pub fn parse_file(input: InputFile, limits: InputLimits) -> ParseReport {
                         });
                     }
                 }
+                if let Some(pending) = &mut attribute {
+                    pending.text.push_str(text.as_ref());
+                }
             }
             Event::End(_) => {
                 if let Some(context) = contexts.pop() {
@@ -267,6 +308,7 @@ pub fn parse_file(input: InputFile, limits: InputLimits) -> ParseReport {
                         &context,
                         &mut report,
                         &mut coordinate,
+                        &mut attribute,
                         &mut feature_depths,
                         limits,
                     );
@@ -325,6 +367,10 @@ struct ElementContext {
     depth: usize,
     xlink_href: Option<String>,
     gml_id: Option<String>,
+    uom: Option<String>,
+    code_space: Option<String>,
+    nil_reason: Option<String>,
+    inside_building_feature: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -332,6 +378,12 @@ struct PendingCoordinates {
     context: ElementContext,
     text: String,
     rejected: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingAttribute {
+    context: ElementContext,
+    text: String,
 }
 
 struct HashingReader {
@@ -431,6 +483,9 @@ fn element_context(
         srs_name: parent.srs_name.clone(),
         dimension: parent.dimension,
         inside_linear_ring: parent.inside_linear_ring || is_gml(name, "LinearRing"),
+        inside_building_feature: parent.inside_building_feature
+            || is_bldg(name, "Building")
+            || is_bldg(name, "BuildingPart"),
         lod: lod_from_element_name(&name.local_name).or(parent.lod),
         depth,
         ..ElementContext::default()
@@ -454,6 +509,15 @@ fn element_context(
                 context.dimension = value.parse().ok();
             }
             "href" if is_bound(&namespace, XLINK_NS) => context.xlink_href = Some(value),
+            "uom" if matches!(namespace, ResolveResult::Unbound) => context.uom = Some(value),
+            "codeSpace" if matches!(namespace, ResolveResult::Unbound) => {
+                context.code_space = Some(value);
+            }
+            "nilReason"
+                if is_bound(&namespace, GML_NS) || matches!(namespace, ResolveResult::Unbound) =>
+            {
+                context.nil_reason = Some(value);
+            }
             _ => {}
         }
     }
@@ -464,6 +528,7 @@ fn handle_start(
     context: &ElementContext,
     report: &mut ParseReport,
     coordinate: &mut Option<PendingCoordinates>,
+    attribute: &mut Option<PendingAttribute>,
     feature_depths: &mut BTreeSet<usize>,
 ) {
     if is_bldg(&context.name, "Building") || is_bldg(&context.name, "BuildingPart") {
@@ -494,6 +559,14 @@ fn handle_start(
             rejected: false,
         });
     }
+    if context.inside_building_feature
+        && (is_bldg(&context.name, "usage") || is_bldg(&context.name, "measuredHeight"))
+    {
+        *attribute = Some(PendingAttribute {
+            context: context.clone(),
+            text: String::new(),
+        });
+    }
 }
 
 fn resolve_same_file_xlinks(report: &mut ParseReport, known_gml_ids: &BTreeSet<String>) {
@@ -519,12 +592,18 @@ fn handle_end(
     context: &ElementContext,
     report: &mut ParseReport,
     coordinate: &mut Option<PendingCoordinates>,
+    attribute: &mut Option<PendingAttribute>,
     feature_depths: &mut BTreeSet<usize>,
     limits: InputLimits,
 ) {
     if is_gml(&context.name, "pos") || is_gml(&context.name, "posList") {
         if let Some(pending) = coordinate.take() {
             emit_coordinates(pending, report, limits);
+        }
+    }
+    if is_bldg(&context.name, "usage") || is_bldg(&context.name, "measuredHeight") {
+        if let Some(pending) = attribute.take() {
+            emit_attribute(pending, report);
         }
     }
     if feature_depths.remove(&context.depth) {
@@ -565,6 +644,49 @@ fn emit_coordinates(pending: PendingCoordinates, report: &mut ParseReport, limit
             axis_order: axis_order(pending.context.srs_name.as_deref()),
             is_linear_ring: pending.context.inside_linear_ring,
             lod: pending.context.lod,
+        }));
+}
+
+fn emit_attribute(pending: PendingAttribute, report: &mut ParseReport) {
+    let value = pending.text.trim();
+    let namespace_uri = pending
+        .context
+        .name
+        .namespace_uri
+        .clone()
+        .unwrap_or_else(|| BLDG_NS.to_owned());
+    let attribute_key = pending.context.name.local_name.clone();
+    let value = match attribute_key.as_str() {
+        "usage" if value.is_empty() => {
+            report.diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::InvalidAttribute,
+                message: "bldg:usage must contain a code value".to_owned(),
+            });
+            return;
+        }
+        "usage" => AttributeValue::Code(value.to_owned()),
+        "measuredHeight" => match value.parse::<f64>() {
+            Ok(value) if value.is_finite() => AttributeValue::Real(value),
+            _ => {
+                report.diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::InvalidAttribute,
+                    message: format!("bldg:measuredHeight is not a finite number: {value}"),
+                });
+                return;
+            }
+        },
+        _ => return,
+    };
+    report
+        .events
+        .push(ParserEvent::BuildingAttribute(BuildingAttribute {
+            namespace_uri,
+            attribute_path: attribute_key.clone(),
+            attribute_key,
+            value,
+            uom: pending.context.uom,
+            code_space: pending.context.code_space,
+            nil_reason: pending.context.nil_reason,
         }));
 }
 
@@ -674,6 +796,47 @@ mod tests {
         );
         let invalid = parse_file(sample_file("<broken>"), InputLimits::default());
         assert_eq!(invalid.diagnostics[0].kind, DiagnosticKind::InvalidXml);
+    }
+
+    #[test]
+    fn emits_typed_building_attributes_with_units_and_code_spaces() {
+        let report = parse_file(
+            sample_file(
+                r#"<b:Building xmlns:b="http://www.opengis.net/citygml/building/2.0" xmlns:g="http://www.opengis.net/gml" g:id="b-1"><b:usage codeSpace="urn:usage">residential</b:usage><b:measuredHeight uom="m">12.5</b:measuredHeight></b:Building>"#,
+            ),
+            InputLimits::default(),
+        );
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        assert!(matches!(
+            &report.events[1],
+            ParserEvent::BuildingAttribute(BuildingAttribute {
+                namespace_uri,
+                attribute_key,
+                value: AttributeValue::Code(value),
+                code_space: Some(code_space),
+                ..
+            }) if namespace_uri == BLDG_NS && attribute_key == "usage" && value == "residential" && code_space == "urn:usage"
+        ));
+        assert!(matches!(
+            &report.events[2],
+            ParserEvent::BuildingAttribute(BuildingAttribute {
+                attribute_key,
+                value: AttributeValue::Real(value),
+                uom: Some(uom),
+                ..
+            }) if attribute_key == "measuredHeight" && (*value - 12.5).abs() < f64::EPSILON && uom == "m"
+        ));
+    }
+
+    #[test]
+    fn reports_invalid_measured_height() {
+        let report = parse_file(
+            sample_file(
+                r#"<b:Building xmlns:b="http://www.opengis.net/citygml/building/2.0" xmlns:g="http://www.opengis.net/gml" g:id="b-1"><b:measuredHeight uom="m">high</b:measuredHeight></b:Building>"#,
+            ),
+            InputLimits::default(),
+        );
+        assert_eq!(report.diagnostics[0].kind, DiagnosticKind::InvalidAttribute);
     }
 
     #[test]
