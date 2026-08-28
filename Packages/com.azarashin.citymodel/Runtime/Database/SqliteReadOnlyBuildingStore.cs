@@ -11,7 +11,7 @@ namespace CityModel.Database
     /// Fixed-query, read-only SQLite store for converter artifacts. This intentionally exposes
     /// no SQL execution surface and never enables SQLite extensions.
     /// </summary>
-    internal sealed class SqliteReadOnlyBuildingStore : IReadOnlyBuildingStore
+    internal sealed class SqliteReadOnlyBuildingStore : IReadOnlyBuildingStore, IReadOnlyFeatureStore
     {
         private const int SqliteOk = 0;
         private const int SqliteRow = 100;
@@ -23,6 +23,8 @@ namespace CityModel.Database
         private static readonly IntPtr SqliteTransient = new IntPtr(-1);
         private const string FindBuildingSql = "SELECT building_id, canonical_building_id, tile_id FROM buildings WHERE building_id = ?1 LIMIT 1";
         private const string FindAttributesSql = "SELECT attribute_key, value_type, value_text, value_integer, value_real, value_boolean, value_datetime, uom, code_space FROM building_attributes WHERE building_id = ?1 ORDER BY attribute_key, ordinal";
+        private const string FindFeatureSql = "SELECT feature_id, canonical_feature_id, feature_type FROM features WHERE feature_id = ?1 LIMIT 1";
+        private const string FindFeatureAttributesSql = "SELECT attribute_key, value_type, value_text, value_integer, value_real, value_boolean, value_datetime, uom, code_space FROM feature_attributes WHERE feature_id = ?1 ORDER BY attribute_key, ordinal";
 
         private readonly object _sync = new object();
         private IntPtr _connection;
@@ -86,6 +88,48 @@ namespace CityModel.Database
                             Unit = GetText(statement, 7),
                             CodeSpace = GetText(statement, 8)
                         });
+                    }
+                }
+                finally { if (statement != IntPtr.Zero) sqlite3_finalize(statement); }
+            }
+        }
+
+        public FeatureRecord FindFeature(string featureId)
+        {
+            if (string.IsNullOrWhiteSpace(featureId)) return null;
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+                IntPtr statement = IntPtr.Zero;
+                try
+                {
+                    PrepareAndBind(FindFeatureSql, featureId, out statement);
+                    var result = sqlite3_step(statement);
+                    if (result == SqliteDone) return null;
+                    ThrowIfNotRow(result);
+                    return new FeatureRecord { FeatureId = GetText(statement, 0), CanonicalFeatureId = GetText(statement, 1), FeatureType = GetText(statement, 2) };
+                }
+                finally { if (statement != IntPtr.Zero) sqlite3_finalize(statement); }
+            }
+        }
+
+        public IReadOnlyList<FeatureAttribute> FindFeatureAttributes(string featureId)
+        {
+            var attributes = new List<FeatureAttribute>();
+            if (string.IsNullOrWhiteSpace(featureId)) return attributes;
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+                IntPtr statement = IntPtr.Zero;
+                try
+                {
+                    PrepareAndBind(FindFeatureAttributesSql, featureId, out statement);
+                    for (;;)
+                    {
+                        var result = sqlite3_step(statement);
+                        if (result == SqliteDone) return attributes;
+                        ThrowIfNotRow(result);
+                        attributes.Add(new FeatureAttribute { Key = GetText(statement, 0), Value = ReadAttributeValue(statement), Unit = GetText(statement, 7), CodeSpace = GetText(statement, 8) });
                     }
                 }
                 finally { if (statement != IntPtr.Zero) sqlite3_finalize(statement); }

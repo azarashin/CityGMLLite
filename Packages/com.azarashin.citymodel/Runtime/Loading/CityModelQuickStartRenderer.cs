@@ -217,6 +217,9 @@ namespace CityModel.Samples
             var decoded = CityModelGlbDecoder.DecodeWithFeatureIds(loadedTile.GlbBytes, loadedTile.Metadata.tileId);
             _tileMeshes.Add(decoded.Mesh);
             tile.AddComponent<MeshFilter>().sharedMesh = decoded.Mesh;
+            // Keep the collider active even when the renderer starts hidden: visibility
+            // controls drawing only, while FeaturePicker resolves loaded mesh triangles.
+            tile.AddComponent<MeshCollider>().sharedMesh = decoded.Mesh;
             var renderer = tile.AddComponent<MeshRenderer>();
             if (!_typeRenderers.TryGetValue(featureType, out var renderers))
             {
