@@ -4,6 +4,7 @@ using System.Threading;
 using CityModel.Coloring;
 using CityModel.Database;
 using CityModel.Loading;
+using CityModel.Picking;
 using UnityEngine;
 
 namespace CityModel.Samples
@@ -35,9 +36,11 @@ namespace CityModel.Samples
         private CancellationTokenSource _cancellation;
         private GameObject _tilesRoot;
         private Material _material;
+        private Material _terrainMaterial;
         private BuildingColorService _colors;
         private readonly List<Material> _tileMaterials = new List<Material>();
         private readonly List<Mesh> _tileMeshes = new List<Mesh>();
+        private readonly List<Texture2D> _tileTextures = new List<Texture2D>();
         private readonly Dictionary<string, GameObject> _typeRoots = new Dictionary<string, GameObject>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, List<MeshRenderer>> _typeRenderers = new Dictionary<string, List<MeshRenderer>>(StringComparer.OrdinalIgnoreCase);
 
@@ -55,6 +58,8 @@ namespace CityModel.Samples
                 _dataset = await CityModelDataset.OpenAsync(datasetRoot, _cancellation.Token);
                 var loadedContents = await LoadConfiguredContentsAsync(_cancellation.Token);
                 if (loadedContents.Count > 0) _material = CreateMaterial();
+                foreach (var loadedContent in loadedContents)
+                    if (IsTerrain(loadedContent.FeatureType)) { _terrainMaterial = CreateTerrainMaterial(); break; }
                 var loadedBuildings = new List<LoadedTile>();
                 foreach (var loadedContent in loadedContents)
                     if (IsBuilding(loadedContent.FeatureType)) loadedBuildings.Add(loadedContent.Tile);
@@ -220,6 +225,8 @@ namespace CityModel.Samples
             // Keep the collider active even when the renderer starts hidden: visibility
             // controls drawing only, while FeaturePicker resolves loaded mesh triangles.
             tile.AddComponent<MeshCollider>().sharedMesh = decoded.Mesh;
+            var featureBinding = tile.AddComponent<CityModelTileFeatureBinding>();
+            featureBinding.Initialize(loadedTile.Metadata.tileId, loadedTile.Metadata.features?.items, decoded.TriangleFeatureIds);
             var renderer = tile.AddComponent<MeshRenderer>();
             if (!_typeRenderers.TryGetValue(featureType, out var renderers))
             {
@@ -227,20 +234,47 @@ namespace CityModel.Samples
                 _typeRenderers.Add(featureType, renderers);
             }
             renderers.Add(renderer);
-            var tileMaterial = new Material(_material)
-            {
-                name = _material.name + " (" + loadedTile.Metadata.tileId + ")",
-            };
+            Material[] tileMaterials;
             if (IsBuilding(featureType))
             {
+                var tileMaterial = new Material(_material)
+                {
+                    name = _material.name + " (" + loadedTile.Metadata.tileId + ")",
+                };
                 var buildingIds = loadedTile.Metadata.features?.buildingIds ?? Array.Empty<string>();
                 ValidateFeatureIds(decoded.FeatureIds, buildingIds, loadedTile.Metadata.tileId);
                 _colors.RegisterTile(loadedTile.Metadata.tileId, buildingIds);
                 _colors.ApplyToMaterial(loadedTile.Metadata.tileId, tileMaterial);
+                tileMaterials = new[] { tileMaterial };
             }
-            renderer.sharedMaterial = tileMaterial;
+            else if (IsTerrain(featureType) && decoded.HasEmbeddedTextures)
+            {
+                ValidateGenericFeatureIds(decoded.FeatureIds, loadedTile.Metadata.features?.items, featureType, loadedTile.Metadata.tileId);
+                tileMaterials = new Material[decoded.Textures.Length];
+                for (var index = 0; index < tileMaterials.Length; index++)
+                {
+                    var tileMaterial = new Material(_terrainMaterial)
+                    {
+                        name = _terrainMaterial.name + " (" + loadedTile.Metadata.tileId + ")",
+                    };
+                    tileMaterial.mainTexture = decoded.Textures[index];
+                    tileMaterials[index] = tileMaterial;
+                    _tileMaterials.Add(tileMaterial);
+                    _tileTextures.Add(decoded.Textures[index]);
+                }
+            }
+            else
+            {
+                var tileMaterial = new Material(_material)
+                {
+                    name = _material.name + " (" + loadedTile.Metadata.tileId + ")",
+                };
+                tileMaterials = new[] { tileMaterial };
+            }
+            renderer.sharedMaterials = tileMaterials;
             renderer.enabled = initiallyVisible;
-            _tileMaterials.Add(tileMaterial);
+            if (!IsTerrain(featureType) || !decoded.HasEmbeddedTextures)
+                _tileMaterials.AddRange(tileMaterials);
         }
 
         private GameObject GetOrCreateTypeRoot(string featureType)
@@ -262,6 +296,11 @@ namespace CityModel.Samples
             return string.Equals(featureType, CityModelFeatureTypes.Building, StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool IsTerrain(string featureType)
+        {
+            return string.Equals(featureType, CityModelFeatureTypes.Terrain, StringComparison.OrdinalIgnoreCase);
+        }
+
         private static void ValidateFeatureIds(IReadOnlyList<ushort> featureIds, IReadOnlyList<string> buildingIds, string tileId)
         {
             for (var index = 0; index < featureIds.Count; index++)
@@ -271,10 +310,27 @@ namespace CityModel.Samples
             }
         }
 
+        private static void ValidateGenericFeatureIds(IReadOnlyList<ushort> featureIds, IReadOnlyList<GenericTileFeature> features, string featureType, string tileId)
+        {
+            for (var index = 0; index < featureIds.Count; index++)
+            {
+                if (featureIds[index] == ushort.MaxValue) continue;
+                if (!CityModel.Picking.FeaturePicker.TryResolveFeature(features, featureIds[index], out var feature) || !string.Equals(feature.featureType, featureType, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("GLB Feature ID does not resolve to the expected generic tile feature: " + tileId);
+            }
+        }
+
         private static Material CreateMaterial()
         {
             var shader = Shader.Find("CityModel/Feature Colors");
             if (shader == null) throw new InvalidOperationException("CityModel/Feature Colors shader is not available.");
+            return new Material(shader);
+        }
+
+        private static Material CreateTerrainMaterial()
+        {
+            var shader = Shader.Find("CityModel/Terrain Textured");
+            if (shader == null) throw new InvalidOperationException("CityModel/Terrain Textured shader is not available.");
             return new Material(shader);
         }
 
@@ -288,10 +344,13 @@ namespace CityModel.Samples
             _tileMaterials.Clear();
             foreach (var tileMesh in _tileMeshes) Destroy(tileMesh);
             _tileMeshes.Clear();
+            foreach (var tileTexture in _tileTextures) Destroy(tileTexture);
+            _tileTextures.Clear();
             _typeRenderers.Clear();
             _typeRoots.Clear();
             if (_tilesRoot != null) Destroy(_tilesRoot);
             if (_material != null) Destroy(_material);
+            if (_terrainMaterial != null) Destroy(_terrainMaterial);
         }
 
         private sealed class LoadedFeatureContent
