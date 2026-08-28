@@ -10,6 +10,9 @@ namespace CityModel.Coloring
     /// <summary>Persists BuildingID colors and uploads only dirty Feature ID slots for loaded tiles.</summary>
     public sealed class BuildingColorService : IBuildingColorService, IDisposable
     {
+        private static readonly int FeatureColorsId = Shader.PropertyToID("_CityModelFeatureColors");
+        private static readonly int FeatureColorCountId = Shader.PropertyToID("_CityModelFeatureColorCount");
+        private static readonly int DefaultColorId = Shader.PropertyToID("_CityModelDefaultColor");
         private readonly Dictionary<string, Color32> _colors = new();
         private readonly Dictionary<string, TileColorTable> _tiles = new();
         private readonly Color32 _defaultColor;
@@ -18,16 +21,31 @@ namespace CityModel.Coloring
         public void ClearColor(string buildingId) { _colors.Remove(buildingId); foreach (var table in _tiles.Values) table.TrySet(buildingId, _defaultColor); }
         public void ClearAll() { _colors.Clear(); foreach (var table in _tiles.Values) table.Reset(_defaultColor); }
         public void RegisterTile(string tileId, IReadOnlyList<string> buildingIds) { var table = new TileColorTable(buildingIds, _defaultColor); foreach (var pair in _colors) table.TrySet(pair.Key, pair.Value); _tiles[tileId] = table; }
+        /// <summary>Binds this tile's Feature ID color table to a renderer using CityModel/Feature Colors.</summary>
+        public void ApplyToRenderer(string tileId, Renderer renderer)
+        {
+            if (renderer == null) throw new ArgumentNullException(nameof(renderer));
+            if (!_tiles.TryGetValue(tileId, out var table)) throw new KeyNotFoundException("Tile color table is not registered: " + tileId);
+            var properties = new MaterialPropertyBlock();
+            renderer.GetPropertyBlock(properties);
+            properties.SetBuffer(FeatureColorsId, table.Buffer);
+            properties.SetInt(FeatureColorCountId, table.Count);
+            properties.SetColor(DefaultColorId, _defaultColor);
+            renderer.SetPropertyBlock(properties);
+        }
         public void UnregisterTile(string tileId) { if (_tiles.Remove(tileId, out var table)) table.Dispose(); }
         public void Dispose() { foreach (var table in _tiles.Values) table.Dispose(); _tiles.Clear(); }
     }
 
     internal sealed class TileColorTable : IDisposable
     {
-        private readonly Dictionary<string, int> _indices = new(); private readonly Color32[] _colors; private GraphicsBuffer _buffer;
-        public TileColorTable(IReadOnlyList<string> buildingIds, Color32 defaultColor) { _colors = new Color32[buildingIds.Count]; for (var index = 0; index < buildingIds.Count; index++) { _indices[buildingIds[index]] = index; _colors[index] = defaultColor; } _buffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Math.Max(1, _colors.Length), 4); _buffer.SetData(_colors); }
-        public bool TrySet(string buildingId, Color32 color) { if (!_indices.TryGetValue(buildingId, out var index)) return false; _colors[index] = color; _buffer.SetData(_colors, index, index, 1); return true; }
-        public void Reset(Color32 color) { Array.Fill(_colors, color); _buffer.SetData(_colors); }
+        private readonly Dictionary<string, int> _indices = new(); private readonly Vector4[] _colors; private readonly int _count; private GraphicsBuffer _buffer;
+        public TileColorTable(IReadOnlyList<string> buildingIds, Color32 defaultColor) { _count = buildingIds.Count; _colors = new Vector4[Math.Max(1, _count)]; for (var index = 0; index < _colors.Length; index++) _colors[index] = ToVector4(defaultColor); for (var index = 0; index < _count; index++) _indices[buildingIds[index]] = index; _buffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _colors.Length, sizeof(float) * 4); _buffer.SetData(_colors); }
+        public GraphicsBuffer Buffer => _buffer;
+        public int Count => _count;
+        public bool TrySet(string buildingId, Color32 color) { if (!_indices.TryGetValue(buildingId, out var index)) return false; _colors[index] = ToVector4(color); _buffer.SetData(_colors, index, index, 1); return true; }
+        public void Reset(Color32 color) { Array.Fill(_colors, ToVector4(color)); _buffer.SetData(_colors); }
         public void Dispose() { _buffer?.Dispose(); _buffer = null; }
+        private static Vector4 ToVector4(Color32 color) { return new Vector4(color.r / 255f, color.g / 255f, color.b / 255f, color.a / 255f); }
     }
 }
