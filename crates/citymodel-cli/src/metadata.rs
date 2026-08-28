@@ -13,6 +13,8 @@ pub struct TileMetadataInput<'a> {
     pub glb_sha256: &'a str,
     pub glb_byte_length: u64,
     pub building_ids: &'a [String],
+    /// Type-neutral feature table. `buildingIds` remains for v1 readers.
+    pub feature_type: &'a str,
     pub tile_bounds: [f64; 4],
     pub content_bounds: [f64; 6],
     pub projected_origin: [f64; 3],
@@ -43,12 +45,12 @@ pub fn safe_relative_path(path: &str) -> Result<&str, &'static str> {
 pub fn tile_metadata_json(input: &TileMetadataInput<'_>) -> Value {
     json!({
         "schemaVersion":"1.0.0", "generationId":input.generation_id, "tileId":input.tile_id,
-        "content":{"glb":input.glb_path,"sha256":input.glb_sha256,"byteLength":input.glb_byte_length},
+        "content":{"featureType":input.feature_type,"glb":input.glb_path,"sha256":input.glb_sha256,"byteLength":input.glb_byte_length},
         "origin":{"geographic":{"latitude":input.geographic_origin[0],"longitude":input.geographic_origin[1],"height":input.geographic_origin[2],"epsg":6668},"projected":{"x":input.projected_origin[0],"y":input.projected_origin[1],"z":input.projected_origin[2],"epsg":input.working_epsg}},
         "coordinateFrame":{"unit":"metre","handedness":"right","xAxis":"east","yAxis":"up","zAxis":"south","projectedToLocalMatrix":[1.0,0.0,0.0,-input.projected_origin[0],0.0,0.0,1.0,-input.projected_origin[2],0.0,-1.0,0.0,input.projected_origin[1],0.0,0.0,0.0,1.0]},
         "tileBounds":{"minX":input.tile_bounds[0],"minY":input.tile_bounds[1],"maxX":input.tile_bounds[2],"maxY":input.tile_bounds[3]},
         "contentBounds":{"minX":input.content_bounds[0],"minY":input.content_bounds[1],"minZ":input.content_bounds[2],"maxX":input.content_bounds[3],"maxY":input.content_bounds[4],"maxZ":input.content_bounds[5]},
-        "features":{"semantic":"_FEATURE_ID_0","componentType":"UNSIGNED_SHORT","nullFeatureId":65535,"buildingIds":input.building_ids},
+        "features":{"semantic":"_FEATURE_ID_0","componentType":"UNSIGNED_SHORT","nullFeatureId":65535,"buildingIds":input.building_ids,"items":input.building_ids.iter().enumerate().map(|(local_feature_id, feature_id)| json!({"localFeatureId":local_feature_id,"featureId":feature_id,"featureType":input.feature_type})).collect::<Vec<_>>()},
         "statistics":{"buildingCount":input.building_ids.len(),"vertexCount":input.vertex_count,"triangleCount":input.triangle_count,"primitiveCount":1}
     })
 }

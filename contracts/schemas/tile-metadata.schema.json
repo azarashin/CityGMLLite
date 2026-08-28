@@ -25,6 +25,7 @@
       "additionalProperties": false,
       "required": ["glb", "sha256", "byteLength"],
       "properties": {
+        "featureType": { "$ref": "#/$defs/nonEmptyString" },
         "glb": { "$ref": "#/$defs/relativePath" },
         "sha256": { "$ref": "#/$defs/sha256" },
         "byteLength": { "type": "integer", "minimum": 0 }
@@ -76,6 +77,12 @@
         "buildingPartIds": {
           "type": "array",
           "items": { "type": ["string", "null"] }
+        },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/genericFeature" },
+          "maxItems": 65535,
+          "uniqueItems": true
         }
       }
     },
@@ -119,6 +126,16 @@
         "y": { "type": "number" },
         "z": { "type": "number" },
         "epsg": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "genericFeature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["localFeatureId", "featureId", "featureType"],
+      "properties": {
+        "localFeatureId": { "type": "integer", "minimum": 0, "maximum": 65534 },
+        "featureId": { "$ref": "#/$defs/nonEmptyString" },
+        "featureType": { "$ref": "#/$defs/nonEmptyString" }
       }
     },
     "tileBounds": {

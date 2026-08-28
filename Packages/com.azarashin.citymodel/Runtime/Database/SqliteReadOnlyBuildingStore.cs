@@ -125,6 +125,27 @@ namespace CityModel.Database
             }
         }
 
+        /// <summary>
+        /// The building queries are compatible with v1 and v2 databases; callers
+        /// must still reject future versions before relying on the v1 tables.
+        /// </summary>
+        internal int ReadUserVersion()
+        {
+            const string sql = "PRAGMA user_version";
+            lock (_sync)
+            {
+                ThrowIfDisposed();
+                IntPtr statement = IntPtr.Zero;
+                try
+                {
+                    Prepare(sql, out statement);
+                    ThrowIfNotRow(sqlite3_step(statement));
+                    return checked((int)sqlite3_column_int64(statement, 0));
+                }
+                finally { if (statement != IntPtr.Zero) sqlite3_finalize(statement); }
+            }
+        }
+
         private void PrepareAndBind(string sql, string value, out IntPtr statement)
         {
             Prepare(sql, out statement);

@@ -12,7 +12,7 @@ pub struct ContractVersion {
 pub const CURRENT_CONTRACT_VERSION: ContractVersion = ContractVersion {
     schema_version: "1.0.0",
     generator_version: "0.1.0-dev",
-    database_user_version: 1,
+    database_user_version: 2,
 };
 
 /// Canonical machine-readable source for version values.
@@ -140,7 +140,7 @@ mod tests {
     fn contract_source_contains_current_versions() {
         assert!(CONTRACT_VERSION_JSON.contains("\"schemaVersion\": \"1.0.0\""));
         assert!(CONTRACT_VERSION_JSON.contains(CURRENT_CONTRACT_VERSION.generator_version));
-        assert!(CONTRACT_VERSION_JSON.contains("\"databaseUserVersion\": 1"));
+        assert!(CONTRACT_VERSION_JSON.contains("\"databaseUserVersion\": 2"));
     }
 
     #[test]
