@@ -1,6 +1,9 @@
 # CityModel Runtime package
 
 This UPM package provides the Unity runtime boundary for CityGMLLite datasets.
+It requires the Universal Render Pipeline (URP). The bundled Unity project is
+configured with the CityModel URP asset; use the same pipeline when importing
+the package into another project.
 
 ## Local installation
 
@@ -13,6 +16,8 @@ directory's `package.json` file.
    `dataset.manifest.json`.
 2. In Package Manager, import **CityModel Runtime > Samples > Quick Start**.
 3. Open `Assets/Samples/CityModel Runtime/0.1.0/Quick Start/QuickStart.unity`.
+   The project must use URP; the sample does not support the Built-in Render
+   Pipeline.
 4. Select **CityModel Quick Start**, set **Dataset Root** to the converter output
    directory, then enter Play mode.
 5. Under **Feature Type Startup Settings**, add one entry for each desired

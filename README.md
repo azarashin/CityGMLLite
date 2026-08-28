@@ -35,7 +35,9 @@ cargo run -p citymodel-cli -- convert `
   --tolerant
 ```
 
-Open `UnityProject/Assets/QuickStart.unity` in Unity 6.5.9f1, set **Dataset
+Open `UnityProject/Assets/QuickStart.unity` in Unity 6.5.9f1. The project uses
+the Universal Render Pipeline (URP) through `Assets/Settings/CityModelURP.asset`.
+Set **Dataset
 Root** on **CityModel Quick Start** to the generated directory, and enter Play
 mode. Under **Feature Type Startup Settings**, choose which generated
 `featureType` values to load and which of those begin visible. A type with

@@ -4,6 +4,9 @@
   "displayName": "CityModel Runtime",
   "description": "Runtime package for CityGMLLite datasets generated as GLB, metadata, and SpatiaLite.",
   "unity": "6000.0",
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.0.1"
+  },
   "keywords": [
     "citygml",
     "plateau",
