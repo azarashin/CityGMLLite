@@ -37,6 +37,7 @@ struct Command {
     input: PathBuf,
     output: Option<PathBuf>,
     mode: Mode,
+    max_lod: u8,
 }
 #[derive(Clone, Debug)]
 struct RawBuilding {
@@ -50,6 +51,7 @@ struct RawRing {
     values: Vec<f64>,
     dimension: usize,
     axis_order: AxisOrder,
+    lod: u8,
 }
 #[derive(Clone, Debug)]
 struct PreparedBuilding {
@@ -58,6 +60,7 @@ struct PreparedBuilding {
     triangles: Vec<citymodel_geometry::Triangle>,
     centroid: Point3,
     attributes: Vec<BuildingAttribute>,
+    lod_used: u8,
 }
 #[derive(Clone, Debug)]
 struct TileOutput {
@@ -81,11 +84,13 @@ struct BuildingAssignment {
     feature_id: u16,
     centroid: Point3,
     attributes: Vec<BuildingAttribute>,
+    lod_used: u8,
 }
 
 #[derive(Clone, Debug)]
 struct ConversionIssue {
     source_file_id: i64,
+    building_id: Option<String>,
     diagnostic: Diagnostic,
 }
 
@@ -94,7 +99,7 @@ fn main() -> ExitCode {
         Ok(command) => run(command),
         Err(message) => {
             eprintln!(
-                "{message}\nusage: citymodel <convert|inspect> <input> [--output <directory>] [--strict|--tolerant]"
+                "{message}\nusage: citymodel convert <input> --output <directory> [--max-lod <0|1|2>] [--strict|--tolerant]\n       citymodel inspect <input>"
             );
             ExitCode::from(2)
         }
@@ -106,6 +111,7 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
     let action = values.next().ok_or("missing command")?;
     let input = PathBuf::from(values.next().ok_or("missing input")?);
     let mut output = None;
+    let mut max_lod = 1;
     let mut mode = match action.as_str() {
         "inspect" => Mode::Inspect,
         "convert" => Mode::Strict,
@@ -120,6 +126,17 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
             }
             "--strict" => mode = Mode::Strict,
             "--tolerant" => mode = Mode::Tolerant,
+            "--max-lod" if action == "convert" => {
+                max_lod = values
+                    .next()
+                    .ok_or("missing --max-lod value")?
+                    .parse::<u8>()
+                    .map_err(|_| "--max-lod must be 0, 1, or 2")?;
+                if max_lod > 2 {
+                    return Err("--max-lod must be 0, 1, or 2".to_owned());
+                }
+            }
+            "--max-lod" => return Err("--max-lod is only supported by convert".to_owned()),
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
@@ -127,6 +144,7 @@ fn parse_command(arguments: impl IntoIterator<Item = String>) -> Result<Command,
         input,
         output,
         mode,
+        max_lod,
     })
 }
 
@@ -152,7 +170,7 @@ fn run(command: Command) -> ExitCode {
         return ExitCode::from(2);
     };
     match atomic_output_handoff(&output, |temporary| {
-        convert(&command.input, temporary, command.mode)
+        convert(&command.input, temporary, command.mode, command.max_lod)
     }) {
         Ok(()) => {
             println!("conversion output: {}", output.display());
@@ -168,7 +186,7 @@ fn run(command: Command) -> ExitCode {
 fn inspect(input: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let files = discover_input_files(input).map_err(diagnostic_error)?;
     let mut buildings = 0_usize;
-    let mut lod1_rings = 0_usize;
+    let mut lod_rings = [0_usize; 3];
     for file in &files {
         let report = parse_file(file.clone(), InputLimits::default());
         buildings += report
@@ -184,14 +202,30 @@ fn inspect(input: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>
                 )
             })
             .count();
-        lod1_rings += report.events.iter().filter(|event| matches!(event, ParserEvent::Coordinates(sequence) if sequence.is_linear_ring && sequence.lod == Some(1))).count();
+        for (count, lod) in lod_rings.iter_mut().zip([0_u8, 1, 2]) {
+            *count += report
+                .events
+                .iter()
+                .filter(|event| match event {
+                    ParserEvent::Coordinates(sequence) => {
+                        sequence.is_linear_ring && sequence.lod == Some(lod)
+                    }
+                    _ => false,
+                })
+                .count();
+        }
     }
     Ok(
-        json!({"input":input,"mode":"inspect","schemaVersion":citymodel_citygml::contract_schema_version(),"files":files.len(),"buildings":buildings,"lod1Rings":lod1_rings}),
+        json!({"input":input,"mode":"inspect","schemaVersion":citymodel_citygml::contract_schema_version(),"files":files.len(),"buildings":buildings,"lod0Rings":lod_rings[0],"lod1Rings":lod_rings[1],"lod2Rings":lod_rings[2]}),
     )
 }
 
-fn convert(input: &Path, output: &Path, mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
+fn convert(
+    input: &Path,
+    output: &Path,
+    mode: Mode,
+    max_lod: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
     let files = discover_input_files(input).map_err(diagnostic_error)?;
     if files.is_empty() {
         return Err("no CityGML files found".into());
@@ -220,6 +254,7 @@ fn convert(input: &Path, output: &Path, mode: Mode) -> Result<(), Box<dyn std::e
                     .cloned()
                     .map(|diagnostic| ConversionIssue {
                         source_file_id,
+                        building_id: None,
                         diagnostic,
                     }),
             );
@@ -232,9 +267,9 @@ fn convert(input: &Path, output: &Path, mode: Mode) -> Result<(), Box<dyn std::e
         ));
         buildings.extend(extract_buildings(&report.events, source_file_id));
     }
-    let prepared = prepare_buildings(buildings)?;
+    let prepared = prepare_buildings(buildings, max_lod, mode, &mut issues)?;
     if prepared.is_empty() {
-        return Err("no LOD1 building geometry was found".into());
+        return Err(format!("no building geometry was found at or below LOD{max_lod}").into());
     }
     let (tile_outputs, assignments) = write_tiles(output, &generation_id, prepared)?;
     let origin = tile_outputs
@@ -262,11 +297,12 @@ fn convert(input: &Path, output: &Path, mode: Mode) -> Result<(), Box<dyn std::e
         &tile_outputs,
         origin,
         &database_sha256,
+        max_lod,
     )?;
     fs::write(
         output.join("conversion.report.json"),
         serde_json::to_vec_pretty(
-            &json!({"datasetId":dataset_id,"generationId":generation_id,"sourceFiles":source_files.len(),"buildings":assignments.len(),"tiles":tile_outputs.len(),"mode":format!("{mode:?}")}),
+            &json!({"datasetId":dataset_id,"generationId":generation_id,"sourceFiles":source_files.len(),"buildings":assignments.len(),"tiles":tile_outputs.len(),"mode":format!("{mode:?}"),"maxLod":max_lod}),
         )?,
     )?;
     Ok(())
@@ -294,13 +330,14 @@ fn extract_buildings(events: &[ParserEvent], source_file_id: i64) -> Vec<RawBuil
                 attributes: Vec::new(),
             }),
             ParserEvent::Coordinates(sequence)
-                if sequence.is_linear_ring && sequence.lod == Some(1) =>
+                if sequence.is_linear_ring && matches!(sequence.lod, Some(0..=2)) =>
             {
                 if let Some(building) = active.iter_mut().rev().find(|item| !item.is_part) {
                     building.rings.push(RawRing {
                         values: sequence.values.clone(),
                         dimension: usize::from(sequence.dimension.unwrap_or(3)),
                         axis_order: sequence.axis_order,
+                        lod: sequence.lod.expect("matched LOD range"),
                     });
                 }
             }
@@ -330,6 +367,9 @@ fn extract_buildings(events: &[ParserEvent], source_file_id: i64) -> Vec<RawBuil
 #[allow(clippy::cast_precision_loss)]
 fn prepare_buildings(
     raw: Vec<RawBuilding>,
+    max_lod: u8,
+    mode: Mode,
+    issues: &mut Vec<ConversionIssue>,
 ) -> Result<Vec<PreparedBuilding>, Box<dyn std::error::Error>> {
     let mut output = Vec::new();
     let mut unique = BTreeSet::new();
@@ -337,12 +377,35 @@ fn prepare_buildings(
         if !unique.insert(building.id.clone()) {
             return Err(format!("duplicate BuildingID: {}", building.id).into());
         }
+        let selected_lod = (0..=max_lod)
+            .rev()
+            .find(|lod| building.rings.iter().any(|ring| ring.lod == *lod));
+        let Some(selected_lod) = selected_lod else {
+            let message = format!(
+                "building {} has no LinearRing geometry at or below requested LOD{}",
+                building.id, max_lod
+            );
+            if mode == Mode::Strict {
+                return Err(message.into());
+            }
+            issues.push(ConversionIssue {
+                source_file_id: building.source_file_id,
+                building_id: Some(building.id),
+                diagnostic: Diagnostic {
+                    kind: citymodel_citygml::DiagnosticKind::UnsupportedElement,
+                    message,
+                },
+            });
+            continue;
+        };
         let polygons: Vec<_> = building
             .rings
             .into_iter()
+            .filter(|ring| ring.lod == selected_lod)
             .filter_map(|ring| ring_to_polygon(&ring))
             .collect();
-        let geometry = normalize_building_geometry(&building.id, None, &polygons, Lod::Lod1);
+        let lod = lod_from_u8(selected_lod).expect("selected LOD is validated");
+        let geometry = normalize_building_geometry(&building.id, None, &polygons, lod);
         if geometry.triangles.is_empty() {
             continue;
         }
@@ -363,6 +426,7 @@ fn prepare_buildings(
             triangles: geometry.triangles,
             centroid,
             attributes: building.attributes,
+            lod_used: selected_lod,
         });
     }
     Ok(output)
@@ -392,8 +456,17 @@ fn ring_to_polygon(ring: &RawRing) -> Option<Polygon> {
     Some(Polygon {
         outer,
         holes: Vec::new(),
-        lod: Lod::Lod1,
+        lod: lod_from_u8(ring.lod)?,
     })
+}
+
+fn lod_from_u8(lod: u8) -> Option<Lod> {
+    match lod {
+        0 => Some(Lod::Lod0),
+        1 => Some(Lod::Lod1),
+        2 => Some(Lod::Lod2),
+        _ => None,
+    }
 }
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
@@ -450,6 +523,7 @@ fn write_tiles(
                 feature_id: feature,
                 centroid: building.centroid,
                 attributes: building.attributes.clone(),
+                lod_used: building.lod_used,
             });
             for triangle in &building.triangles {
                 let mut local = triangle.clone();
@@ -558,14 +632,14 @@ fn write_database(
             },
         )?;
         let attributes_json = attributes_json(&assignment.attributes);
-        connection.execute("UPDATE buildings SET tile_id=?1, local_feature_id=?2, centroid_x=?3, centroid_y=?4, attributes_json=?5 WHERE building_id=?6", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.centroid.x, assignment.centroid.y, attributes_json, assignment.building_id])?;
+        connection.execute("UPDATE buildings SET tile_id=?1, local_feature_id=?2, lod_used=?3, centroid_x=?4, centroid_y=?5, attributes_json=?6 WHERE building_id=?7", params![assignment.tile_id, i64::from(assignment.feature_id), i64::from(assignment.lod_used), assignment.centroid.x, assignment.centroid.y, attributes_json, assignment.building_id])?;
         connection.execute("INSERT INTO tile_features (tile_id, local_feature_id, building_id, building_part_id) VALUES (?1, ?2, ?3, NULL)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
         insert_attributes(&connection, &assignment.building_id, &assignment.attributes)?;
     }
     for issue in issues {
         connection.execute(
-            "INSERT INTO conversion_issues (source_file_id, building_id, gml_id, severity, error_code, message, element_path, repaired, exclusion_reason, occurred_at) VALUES (?1, NULL, NULL, 'warn', ?2, ?3, NULL, 0, NULL, '1970-01-01T00:00:00Z')",
-            params![issue.source_file_id, format!("{:?}", issue.diagnostic.kind), issue.diagnostic.message],
+            "INSERT INTO conversion_issues (source_file_id, building_id, gml_id, severity, error_code, message, element_path, repaired, exclusion_reason, occurred_at) VALUES (?1, ?2, ?2, 'warn', ?3, ?4, NULL, 0, NULL, '1970-01-01T00:00:00Z')",
+            params![issue.source_file_id, issue.building_id, format!("{:?}", issue.diagnostic.kind), issue.diagnostic.message],
         )?;
     }
     verify_integrity(&connection)?;
@@ -620,6 +694,7 @@ fn attributes_json(attributes: &[BuildingAttribute]) -> String {
     serde_json::to_string(&values).expect("attribute JSON serialization cannot fail")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_manifest(
     output: &Path,
     dataset_id: &str,
@@ -628,6 +703,7 @@ fn write_manifest(
     tiles: &[TileOutput],
     origin: Point3,
     database_sha256: &str,
+    max_lod: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let geographic = inverse_web_mercator(origin);
     let input_files = source_files.iter().map(|(_, path, sha256, _)| json!({"path":path.file_name().and_then(|name| name.to_str()).unwrap_or("input.gml"),"sha256":sha256})).collect::<Vec<_>>();
@@ -635,7 +711,7 @@ fn write_manifest(
         .iter()
         .map(|tile| json!({"tileId":tile.id,"metadata":tile.metadata_path}))
         .collect::<Vec<_>>();
-    let manifest = json!({"schemaVersion":"1.0.0","datasetId":dataset_id,"generationId":generation_id,"generatedAt":"1970-01-01T00:00:00Z","generator":{"name":"citymodel","version":"0.1.0-dev"},"source":{"format":"CityGML","profile":"PLATEAU","citygmlVersion":"2.0","files":source_files.len(),"inputFiles":input_files,"conversionConfiguration":{"lod":1,"tileSizeMetres":DEFAULT_TILE_SIZE_METERS,"workingCrs":"EPSG:3857"}},"coordinateReference":{"sourceCrs":{"epsg":6697,"wkt":null,"axisOrder":["latitude","longitude","height"]},"workingCrs":{"epsg":WORKING_EPSG,"wkt":null,"axisOrder":["easting","northing","height"],"unit":"metre"},"verticalReference":{"type":"source-defined","epsg":null,"geoidModel":null}},"datasetOrigin":{"geographic":{"latitude":geographic.0,"longitude":geographic.1,"height":origin.z,"epsg":4326},"projected":{"x":origin.x,"y":origin.y,"z":origin.z,"epsg":WORKING_EPSG}},"tiling":{"scheme":"projected-grid","defaultTileSizeMetres":DEFAULT_TILE_SIZE_METERS,"buildingAssignment":"representative-point","geometryClipping":false},"modelProfile":{"lod":1,"textures":false,"compression":null,"featureIdSemantic":"_FEATURE_ID_0","featureIdComponentType":"UNSIGNED_SHORT"},"database":{"path":"citymodel.sqlite","sha256":database_sha256},"tiles":{"indexType":"inline","items":items}});
+    let manifest = json!({"schemaVersion":"1.0.0","datasetId":dataset_id,"generationId":generation_id,"generatedAt":"1970-01-01T00:00:00Z","generator":{"name":"citymodel","version":"0.1.0-dev"},"source":{"format":"CityGML","profile":"PLATEAU","citygmlVersion":"2.0","files":source_files.len(),"inputFiles":input_files,"conversionConfiguration":{"lod":max_lod,"maxLod":max_lod,"lodSelection":"highest-available-at-or-below-max-lod","tileSizeMetres":DEFAULT_TILE_SIZE_METERS,"workingCrs":"EPSG:3857"}},"coordinateReference":{"sourceCrs":{"epsg":6697,"wkt":null,"axisOrder":["latitude","longitude","height"]},"workingCrs":{"epsg":WORKING_EPSG,"wkt":null,"axisOrder":["easting","northing","height"],"unit":"metre"},"verticalReference":{"type":"source-defined","epsg":null,"geoidModel":null}},"datasetOrigin":{"geographic":{"latitude":geographic.0,"longitude":geographic.1,"height":origin.z,"epsg":4326},"projected":{"x":origin.x,"y":origin.y,"z":origin.z,"epsg":WORKING_EPSG}},"tiling":{"scheme":"projected-grid","defaultTileSizeMetres":DEFAULT_TILE_SIZE_METERS,"buildingAssignment":"representative-point","geometryClipping":false},"modelProfile":{"lod":max_lod,"textures":false,"compression":null,"featureIdSemantic":"_FEATURE_ID_0","featureIdComponentType":"UNSIGNED_SHORT"},"database":{"path":"citymodel.sqlite","sha256":database_sha256},"tiles":{"indexType":"inline","items":items}});
     fs::write(
         output.join("dataset.manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -742,6 +818,30 @@ mod tests {
             .mode,
             Mode::Tolerant
         );
+        assert_eq!(
+            parse_command([
+                "convert".into(),
+                "x.gml".into(),
+                "--output".into(),
+                "out".into(),
+                "--max-lod".into(),
+                "2".into(),
+            ])
+            .unwrap()
+            .max_lod,
+            2
+        );
+        assert!(
+            parse_command([
+                "convert".into(),
+                "x.gml".into(),
+                "--output".into(),
+                "out".into(),
+                "--max-lod".into(),
+                "3".into(),
+            ])
+            .is_err()
+        );
     }
     #[test]
     fn web_mercator_round_trips() {
@@ -758,7 +858,7 @@ mod tests {
         let output = std::env::temp_dir().join(format!("citymodel-cli-e2e-{}", std::process::id()));
         let _ = fs::remove_dir_all(&output);
         fs::create_dir_all(&output).unwrap();
-        convert(&fixture, &output, Mode::Strict).unwrap();
+        convert(&fixture, &output, Mode::Strict, 1).unwrap();
 
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("dataset.manifest.json")).unwrap())
@@ -838,9 +938,9 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&strict_output);
         let _ = fs::remove_dir_all(&tolerant_output);
-        assert!(convert(&input, &strict_output, Mode::Strict).is_err());
+        assert!(convert(&input, &strict_output, Mode::Strict, 1).is_err());
         fs::create_dir_all(&tolerant_output).unwrap();
-        convert(&input, &tolerant_output, Mode::Tolerant).unwrap();
+        convert(&input, &tolerant_output, Mode::Tolerant, 1).unwrap();
         let database =
             rusqlite::Connection::open(tolerant_output.join("citymodel.sqlite")).unwrap();
         let issue: (String, String) = database
@@ -855,5 +955,101 @@ mod tests {
         drop(database);
         fs::remove_file(input).unwrap();
         fs::remove_dir_all(tolerant_output).unwrap();
+    }
+
+    #[test]
+    fn max_lod_selects_highest_available_lod_per_building() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/plateau-multi-lod-small.gml");
+        let output =
+            std::env::temp_dir().join(format!("citymodel-cli-multi-lod-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&output);
+        fs::create_dir_all(&output).unwrap();
+
+        convert(&fixture, &output, Mode::Strict, 2).unwrap();
+        let database = rusqlite::Connection::open(output.join("citymodel.sqlite")).unwrap();
+        let selected: Vec<(String, i64)> = database
+            .prepare("SELECT building_id, lod_used FROM buildings ORDER BY building_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![
+                ("building-all".to_owned(), 2),
+                ("building-lod0".to_owned(), 0),
+                ("building-lod1".to_owned(), 1),
+                ("building-lod2-only".to_owned(), 2),
+            ]
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("dataset.manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["source"]["conversionConfiguration"]["maxLod"], 2);
+        assert_eq!(manifest["modelProfile"]["lod"], 2);
+        drop(database);
+
+        fs::remove_dir_all(&output).unwrap();
+    }
+
+    #[test]
+    fn tolerant_max_lod_records_buildings_without_a_permitted_lod() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/plateau-multi-lod-small.gml");
+        let output = std::env::temp_dir().join(format!(
+            "citymodel-cli-multi-lod-tolerant-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&output);
+        fs::create_dir_all(&output).unwrap();
+
+        assert!(convert(&fixture, &output, Mode::Strict, 1).is_err());
+        let _ = fs::remove_dir_all(&output);
+        fs::create_dir_all(&output).unwrap();
+        convert(&fixture, &output, Mode::Tolerant, 1).unwrap();
+        let database = rusqlite::Connection::open(output.join("citymodel.sqlite")).unwrap();
+        let selected: Vec<(String, i64)> = database
+            .prepare("SELECT building_id, lod_used FROM buildings ORDER BY building_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![
+                ("building-all".to_owned(), 0),
+                ("building-lod0".to_owned(), 0),
+                ("building-lod1".to_owned(), 1),
+            ]
+        );
+        let issue: (String, String) = database
+            .query_row(
+                "SELECT building_id, error_code FROM conversion_issues",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            issue,
+            (
+                "building-lod2-only".to_owned(),
+                "UnsupportedElement".to_owned()
+            )
+        );
+        drop(database);
+        fs::remove_dir_all(output).unwrap();
+    }
+
+    #[test]
+    fn inspect_reports_linear_ring_counts_for_each_supported_lod() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/plateau-multi-lod-small.gml");
+        let report = inspect(&fixture).unwrap();
+        assert_eq!(report["lod0Rings"], 2);
+        assert_eq!(report["lod1Rings"], 1);
+        assert_eq!(report["lod2Rings"], 2);
     }
 }
