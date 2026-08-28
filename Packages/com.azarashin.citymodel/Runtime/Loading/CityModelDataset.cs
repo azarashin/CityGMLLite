@@ -3,6 +3,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using CityModel.Database;
 using CityModel.Versioning;
 using UnityEngine;
 
@@ -14,8 +15,16 @@ namespace CityModel.Loading
         public string schemaVersion;
         public string datasetId;
         public string generationId;
+        public ManifestDatabase database;
         public ProjectedOrigin datasetOrigin;
         public ManifestTiles tiles;
+    }
+
+    [Serializable]
+    public sealed class ManifestDatabase
+    {
+        public string path;
+        public string sha256;
     }
 
     [Serializable]
@@ -95,6 +104,8 @@ namespace CityModel.Loading
 
         public static async Task<CityModelDataset> OpenAsync(string rootDirectory, CancellationToken cancellationToken, int maxConcurrentLoads = 2)
         {
+            if (string.IsNullOrWhiteSpace(rootDirectory)) throw new ArgumentException("Dataset root is required.", nameof(rootDirectory));
+            rootDirectory = Path.GetFullPath(rootDirectory);
             var manifestPath = Path.Combine(rootDirectory, "dataset.manifest.json");
             var json = await File.ReadAllTextAsync(manifestPath, cancellationToken).ConfigureAwait(false);
             var manifest = JsonUtility.FromJson<DatasetManifest>(json) ?? throw new InvalidDataException("Manifest cannot be parsed.");
@@ -103,6 +114,13 @@ namespace CityModel.Loading
             if (manifest.tiles == null || manifest.tiles.indexType != "inline" || manifest.tiles.items == null)
                 throw new InvalidDataException("Only manifests with an inline tile index are supported.");
             return new CityModelDataset(rootDirectory, manifest, maxConcurrentLoads);
+        }
+
+        /// <summary>Opens the dataset's manifest-declared SQLite artifact through the read-only Windows bridge.</summary>
+        public Task<BuildingDatabase> OpenBuildingDatabaseAsync(CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+            return BuildingDatabase.OpenAsync(_rootDirectory, Manifest, cancellationToken);
         }
 
         public async Task<LoadedTile> LoadTileAsync(ManifestTile tile, CancellationToken cancellationToken)
@@ -145,8 +163,14 @@ namespace CityModel.Loading
         public void Dispose() { if (!_disposed) { _loadGate.Dispose(); _disposed = true; } }
         private string ResolveRelativePath(string relativePath)
         {
-            if (Path.IsPathRooted(relativePath) || relativePath.Contains("..")) throw new InvalidDataException("Dataset path escapes its root.");
-            return Path.Combine(_rootDirectory, relativePath);
+            if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath)) throw new InvalidDataException("Dataset path escapes its root.");
+            var root = Path.GetFullPath(_rootDirectory);
+            var candidate = Path.GetFullPath(Path.Combine(root, relativePath));
+            var rootWithSeparator = root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
+                ? root
+                : root + Path.DirectorySeparatorChar;
+            if (!candidate.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Dataset path escapes its root.");
+            return candidate;
         }
         private static string ToSha256(byte[] bytes) { using var hash = SHA256.Create(); return BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-", string.Empty).ToLowerInvariant(); }
         private void ThrowIfDisposed() { if (_disposed) throw new ObjectDisposedException(nameof(CityModelDataset)); }
