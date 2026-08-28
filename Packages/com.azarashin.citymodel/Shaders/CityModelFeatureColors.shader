@@ -21,7 +21,10 @@ Shader "CityModel/Feature Colors"
             #pragma target 4.5
             #pragma vertex Vert
             #pragma fragment Frag
+            #pragma multi_compile_fwdbase
             #include "UnityCG.cginc"
+            #include "Lighting.cginc"
+            #include "AutoLight.cginc"
 
             StructuredBuffer<float4> _CityModelFeatureColors;
             int _CityModelFeatureColorCount;
@@ -30,6 +33,7 @@ Shader "CityModel/Feature Colors"
             struct Attributes
             {
                 float4 positionOS : POSITION;
+                float3 normalOS : NORMAL;
                 float2 featureId : TEXCOORD1;
             };
 
@@ -37,6 +41,8 @@ Shader "CityModel/Feature Colors"
             {
                 float4 positionCS : SV_POSITION;
                 nointerpolation uint featureId : TEXCOORD0;
+                float3 worldNormal : TEXCOORD1;
+                SHADOW_COORDS(2)
             };
 
             Varyings Vert(Attributes input)
@@ -44,6 +50,8 @@ Shader "CityModel/Feature Colors"
                 Varyings output;
                 output.positionCS = UnityObjectToClipPos(input.positionOS);
                 output.featureId = (uint)round(input.featureId.x);
+                output.worldNormal = UnityObjectToWorldNormal(input.normalOS);
+                TRANSFER_SHADOW(output)
                 return output;
             }
 
@@ -54,6 +62,12 @@ Shader "CityModel/Feature Colors"
                 {
                     color = _CityModelFeatureColors[input.featureId];
                 }
+
+                float3 worldNormal = normalize(input.worldNormal);
+                float3 ambient = ShadeSH9(float4(worldNormal, 1.0));
+                float lambert = saturate(dot(worldNormal, _WorldSpaceLightPos0.xyz));
+                float shadowAttenuation = SHADOW_ATTENUATION(input);
+                color.rgb *= ambient + (_LightColor0.rgb * (lambert * shadowAttenuation));
 
                 // Keep the feature layer opaque even if a missing binding or source
                 // attribute supplied an unexpected alpha channel.
