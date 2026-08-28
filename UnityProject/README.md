@@ -16,7 +16,10 @@ so package and runtime changes are immediately visible without publishing it.
 3. Open `Assets/QuickStart.unity`.
 4. Set **Dataset Root** on **CityModel Quick Start** to the generated output
    directory containing `dataset.manifest.json`.
-5. Enter Play mode. The Console reports how many tiles were rendered.
+5. Under **Feature Type Startup Settings**, add each `featureType` that should
+   load. **Initially Visible** is effective only when **Load On Startup** is
+   enabled; loaded hidden types remain in memory and can be enabled later.
+6. Enter Play mode. The Console reports how many content items were loaded.
 
 The first editor launch creates `Library/`, generated project settings, and the
 package lock file. These generated files are ignored by Git.
