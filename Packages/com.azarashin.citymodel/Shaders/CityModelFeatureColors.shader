@@ -3,13 +3,20 @@ Shader "CityModel/Feature Colors"
     Properties
     {
         _CityModelDefaultColor("Default color", Color) = (0.56, 0.59, 0.64, 1)
+        [HideInInspector] _CityModelFeatureColorCount("Feature color count", Int) = 0
     }
     SubShader
     {
         Tags { "RenderType" = "Opaque" "Queue" = "Geometry" }
         Pass
         {
-            Tags { "LightMode" = "SRPDefaultUnlit" }
+            // The Quick Start project uses the Built-in Render Pipeline.  SRPDefaultUnlit
+            // is not selected there, so use the Built-in forward pass explicitly.
+            Tags { "LightMode" = "ForwardBase" }
+            Cull Back
+            ZWrite On
+            ZTest LEqual
+            Blend One Zero
             HLSLPROGRAM
             #pragma target 4.5
             #pragma vertex Vert
@@ -42,9 +49,16 @@ Shader "CityModel/Feature Colors"
 
             float4 Frag(Varyings input) : SV_Target
             {
-                return input.featureId < (uint)_CityModelFeatureColorCount
-                    ? _CityModelFeatureColors[input.featureId]
-                    : _CityModelDefaultColor;
+                float4 color = _CityModelDefaultColor;
+                if (_CityModelFeatureColorCount > 0 && input.featureId < (uint)_CityModelFeatureColorCount)
+                {
+                    color = _CityModelFeatureColors[input.featureId];
+                }
+
+                // Keep the feature layer opaque even if a missing binding or source
+                // attribute supplied an unexpected alpha channel.
+                color.a = 1.0;
+                return color;
             }
             ENDHLSL
         }
