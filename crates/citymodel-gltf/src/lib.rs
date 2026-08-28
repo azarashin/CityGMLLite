@@ -17,6 +17,29 @@ pub struct TileGlbInput {
     pub triangles: Vec<Triangle>,
     pub feature_ids: BTreeMap<String, u16>,
 }
+/// A terrain triangle with per-vertex UVs and a tile-local feature identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerrainTriangle {
+    pub positions: [citymodel_coordinate::Point3; 3],
+    pub uvs: [(f64, f64); 3],
+    pub feature_id: String,
+    pub texture_index: usize,
+}
+/// An image embedded in a terrain GLB.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerrainTexture {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+/// Input for a self-contained, textured terrain GLB.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerrainGlbInput {
+    pub tile_id: String,
+    pub generation_id: String,
+    pub triangles: Vec<TerrainTriangle>,
+    pub feature_ids: BTreeMap<String, u16>,
+    pub textures: Vec<TerrainTexture>,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlbAsset {
     pub bytes: Vec<u8>,
@@ -26,6 +49,161 @@ pub struct GlbAsset {
 pub enum GlbError {
     MissingFeatureId(String),
     InvalidGlb,
+    InvalidTexture,
+}
+
+/// Produces a self-contained textured terrain GLB. Images are stored in GLB
+/// buffer views; no external URI is emitted.
+///
+/// # Errors
+///
+/// Returns an error for missing feature identities, unsupported textures, or a
+/// GLB that cannot be represented within the format's integer limits.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+pub fn write_terrain_glb(input: &TerrainGlbInput) -> Result<GlbAsset, GlbError> {
+    if input.textures.is_empty() || input.triangles.is_empty() {
+        return Err(GlbError::InvalidTexture);
+    }
+    if input.textures.iter().any(|texture| {
+        texture.bytes.is_empty()
+            || !matches!(texture.mime_type.as_str(), "image/png" | "image/jpeg")
+    }) {
+        return Err(GlbError::InvalidTexture);
+    }
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut feature_ids = Vec::new();
+    let mut indices = vec![Vec::<u32>::new(); input.textures.len()];
+    for triangle in &input.triangles {
+        let feature = input
+            .feature_ids
+            .get(&triangle.feature_id)
+            .copied()
+            .ok_or_else(|| GlbError::MissingFeatureId(triangle.feature_id.clone()))?;
+        let Some(texture_indices) = indices.get_mut(triangle.texture_index) else {
+            return Err(GlbError::InvalidTexture);
+        };
+        let base = u32::try_from(feature_ids.len()).map_err(|_| GlbError::InvalidGlb)?;
+        let normal = terrain_normal(triangle.positions);
+        for (point, uv) in triangle.positions.into_iter().zip(triangle.uvs) {
+            positions.extend([point.x as f32, point.y as f32, point.z as f32]);
+            normals.extend(normal);
+            uvs.extend([uv.0 as f32, uv.1 as f32]);
+            feature_ids.push(feature);
+        }
+        texture_indices.extend([base, base + 1, base + 2]);
+    }
+    let mut binary = Vec::new();
+    let position_offset = append_f32(&mut binary, &positions);
+    let normal_offset = append_f32(&mut binary, &normals);
+    let uv_offset = append_f32(&mut binary, &uvs);
+    let feature_offset = append_u16(&mut binary, &feature_ids);
+    let mut index_offsets = Vec::new();
+    for values in &indices {
+        index_offsets.push((append_u32(&mut binary, values), values.len() * 4));
+    }
+    let mut image_offsets = Vec::new();
+    for texture in &input.textures {
+        pad(&mut binary);
+        let offset = binary.len();
+        binary.extend(&texture.bytes);
+        image_offsets.push((offset, texture.bytes.len()));
+    }
+    pad(&mut binary);
+    let mut buffer_views = vec![
+        format!(
+            r#"{{"buffer":0,"byteOffset":{position_offset},"byteLength":{},"target":34962}}"#,
+            positions.len() * 4
+        ),
+        format!(
+            r#"{{"buffer":0,"byteOffset":{normal_offset},"byteLength":{},"target":34962}}"#,
+            normals.len() * 4
+        ),
+        format!(
+            r#"{{"buffer":0,"byteOffset":{uv_offset},"byteLength":{},"target":34962}}"#,
+            uvs.len() * 4
+        ),
+        format!(
+            r#"{{"buffer":0,"byteOffset":{feature_offset},"byteLength":{},"target":34962}}"#,
+            feature_ids.len() * 2
+        ),
+    ];
+    buffer_views.extend(index_offsets.iter().map(|(offset, length)| {
+        format!(r#"{{"buffer":0,"byteOffset":{offset},"byteLength":{length},"target":34963}}"#)
+    }));
+    buffer_views.extend(image_offsets.iter().map(|(offset, length)| {
+        format!(r#"{{"buffer":0,"byteOffset":{offset},"byteLength":{length}}}"#)
+    }));
+    let primitive_json = indices.iter().enumerate().filter(|(_, values)| !values.is_empty()).map(|(index, _)| {
+        format!(r#"{{"attributes":{{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2,"_FEATURE_ID_0":3}},"indices":{},"material":{},"mode":4}}"#, 4 + index, index)
+    }).collect::<Vec<_>>().join(",");
+    let images = input
+        .textures
+        .iter()
+        .enumerate()
+        .map(|(index, texture)| {
+            format!(
+                r#"{{"bufferView":{},"mimeType":"{}"}}"#,
+                4 + indices.len() + index,
+                texture.mime_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let textures = (0..input.textures.len())
+        .map(|index| format!(r#"{{"source":{index}}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let materials = (0..input.textures.len()).map(|index| format!(r#"{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":{index}}},"metallicFactor":0.0,"roughnessFactor":1.0}}}}"#)).collect::<Vec<_>>().join(",");
+    let json = format!(
+        r#"{{"asset":{{"version":"2.0","generator":"CityGMLLite","extras":{{"schemaVersion":"{}","tileId":"{}","generationId":"{}"}}}},"buffers":[{{"byteLength":{}}}],"bufferViews":[{}],"accessors":[{{"bufferView":0,"componentType":5126,"count":{},"type":"VEC3"}},{{"bufferView":1,"componentType":5126,"count":{},"type":"VEC3"}},{{"bufferView":2,"componentType":5126,"count":{},"type":"VEC2"}},{{"bufferView":3,"componentType":5123,"normalized":false,"count":{},"type":"SCALAR"}}],"images":[{}],"textures":[{}],"materials":[{}],"meshes":[{{"primitives":[{}]}}],"nodes":[{{"mesh":0}}],"scenes":[{{"nodes":[0]}}],"scene":0}}"#,
+        contract_schema_version(),
+        input.tile_id,
+        input.generation_id,
+        binary.len(),
+        buffer_views.join(","),
+        feature_ids.len(),
+        feature_ids.len(),
+        feature_ids.len(),
+        feature_ids.len(),
+        images,
+        textures,
+        materials,
+        primitive_json
+    );
+    let mut json = json.into_bytes();
+    pad(&mut json);
+    let total = 12 + 8 + json.len() + 8 + binary.len();
+    let mut bytes = Vec::with_capacity(total);
+    bytes.extend_from_slice(b"glTF");
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    bytes.extend_from_slice(
+        &(u32::try_from(total).map_err(|_| GlbError::InvalidGlb)?).to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &(u32::try_from(json.len()).map_err(|_| GlbError::InvalidGlb)?).to_le_bytes(),
+    );
+    bytes.extend_from_slice(b"JSON");
+    bytes.extend(json);
+    bytes.extend_from_slice(
+        &(u32::try_from(binary.len()).map_err(|_| GlbError::InvalidGlb)?).to_le_bytes(),
+    );
+    bytes.extend_from_slice(b"BIN\0");
+    bytes.extend(binary);
+    validate_glb(&bytes)?;
+    Ok(GlbAsset {
+        sha256: hex(Sha256::digest(&bytes)),
+        bytes,
+    })
+}
+
+fn terrain_normal(positions: [citymodel_coordinate::Point3; 3]) -> [f32; 3] {
+    normal(&Triangle {
+        positions,
+        building_id: String::new(),
+        building_part_id: None,
+    })
 }
 
 /// Produces one combined glTF 2.0 binary mesh per tile.
@@ -210,5 +388,45 @@ mod tests {
                 .any(|chunk| chunk == b"_FEATURE_ID_0")
         );
         assert_eq!(asset.sha256.len(), 64);
+    }
+
+    #[test]
+    fn embeds_terrain_texture_and_uvs() {
+        let positions = [
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Point3 {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Point3 {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+        ];
+        let asset = write_terrain_glb(&TerrainGlbInput {
+            tile_id: "terrain-tile".into(),
+            generation_id: "g".into(),
+            triangles: vec![TerrainTriangle {
+                positions,
+                uvs: [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+                feature_id: "terrain-1".into(),
+                texture_index: 0,
+            }],
+            feature_ids: BTreeMap::from([("terrain-1".into(), 0)]),
+            textures: vec![TerrainTexture {
+                mime_type: "image/png".into(),
+                bytes: vec![137, 80, 78, 71],
+            }],
+        })
+        .unwrap();
+        assert!(asset.bytes.windows(10).any(|part| part == b"TEXCOORD_0"));
+        assert!(asset.bytes.windows(9).any(|part| part == b"image/png"));
+        validate_glb(&asset.bytes).unwrap();
     }
 }
