@@ -64,12 +64,22 @@ namespace CityModel.Loading
     }
 
     [Serializable]
+    public sealed class TileFeatures
+    {
+        public string semantic;
+        public string componentType;
+        public int nullFeatureId;
+        public string[] buildingIds;
+    }
+
+    [Serializable]
     public sealed class TileMetadata
     {
         public string schemaVersion;
         public string generationId;
         public string tileId;
         public TileContent content;
+        public TileFeatures features;
         public ProjectedOrigin origin;
     }
 

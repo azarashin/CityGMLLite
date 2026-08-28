@@ -6,6 +6,14 @@ using UnityEngine.Rendering;
 
 namespace CityModel.Loading
 {
+    /// <summary>Mesh data plus the converter's tile-local Feature ID for every vertex.</summary>
+    public sealed class DecodedTileMesh
+    {
+        public DecodedTileMesh(Mesh mesh, ushort[] featureIds) { Mesh = mesh; FeatureIds = featureIds; }
+        public Mesh Mesh { get; }
+        public ushort[] FeatureIds { get; }
+    }
+
     /// <summary>Decodes the constrained GLB 2.0 layout emitted by CityGMLLite's converter.</summary>
     public static class CityModelGlbDecoder
     {
@@ -21,6 +29,11 @@ namespace CityModel.Loading
         [Serializable] private sealed class GlbAttributes { public int POSITION = -1; public int NORMAL = -1; public int _FEATURE_ID_0 = -1; }
 
         public static Mesh Decode(byte[] glbBytes, string meshName)
+        {
+            return DecodeWithFeatureIds(glbBytes, meshName).Mesh;
+        }
+
+        public static DecodedTileMesh DecodeWithFeatureIds(byte[] glbBytes, string meshName)
         {
             if (glbBytes == null || glbBytes.Length < 20)
                 throw new InvalidDataException("GLB is too short.");
@@ -47,14 +60,17 @@ namespace CityModel.Loading
             if (vertices.Length != normals.Length)
                 throw new InvalidDataException("POSITION and NORMAL counts differ.");
             var indices = ReadIndexAccessor(root, binary, primitive.indices, vertices.Length);
-            ValidateFeatureIds(root, binary, primitive.attributes._FEATURE_ID_0, vertices.Length);
+            var featureIds = ReadFeatureIds(root, binary, primitive.attributes._FEATURE_ID_0, vertices.Length);
 
             var mesh = new Mesh { name = meshName, indexFormat = IndexFormat.UInt32 };
             mesh.vertices = vertices;
             mesh.normals = normals;
             mesh.triangles = indices;
+            var featureUvs = new Vector2[featureIds.Length];
+            for (var index = 0; index < featureUvs.Length; index++) featureUvs[index] = new Vector2(featureIds[index], 0f);
+            mesh.uv2 = featureUvs;
             mesh.RecalculateBounds();
-            return mesh;
+            return new DecodedTileMesh(mesh, featureIds);
         }
 
         private static Vector3[] ReadVector3Accessor(GlbRoot root, byte[] binary, int accessorIndex, string name)
@@ -92,16 +108,26 @@ namespace CityModel.Loading
             return values;
         }
 
-        private static void ValidateFeatureIds(GlbRoot root, byte[] binary, int accessorIndex, int vertexCount)
+        private static ushort[] ReadFeatureIds(GlbRoot root, byte[] binary, int accessorIndex, int vertexCount)
         {
-            if (accessorIndex < 0) return;
+            var values = new ushort[vertexCount];
+            if (accessorIndex < 0)
+            {
+                for (var index = 0; index < values.Length; index++) values[index] = ushort.MaxValue;
+                return values;
+            }
             var accessor = GetAccessor(root, accessorIndex, "_FEATURE_ID_0");
             if (accessor.componentType != 5123 || accessor.type != "SCALAR" || accessor.count != vertexCount)
                 throw new InvalidDataException("_FEATURE_ID_0 must be UNSIGNED_SHORT with one value per vertex.");
             var view = GetBufferView(root, accessor.bufferView, "_FEATURE_ID_0");
             var stride = view.byteStride == 0 ? 2 : view.byteStride;
             if (stride < 2) throw new InvalidDataException("_FEATURE_ID_0 stride is too small.");
-            for (var i = 0; i < accessor.count; i++) GetEntryOffset(view, accessor, binary, stride, i, 2, "_FEATURE_ID_0");
+            for (var i = 0; i < accessor.count; i++)
+            {
+                var entry = GetEntryOffset(view, accessor, binary, stride, i, 2, "_FEATURE_ID_0");
+                values[i] = (ushort)(binary[entry] | binary[entry + 1] << 8);
+            }
+            return values;
         }
 
         private static GlbAccessor GetAccessor(GlbRoot root, int index, string name)
