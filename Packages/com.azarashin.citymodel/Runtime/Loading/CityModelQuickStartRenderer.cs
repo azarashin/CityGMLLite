@@ -25,6 +25,7 @@ namespace CityModel.Samples
         private GameObject _tilesRoot;
         private Material _material;
         private BuildingColorService _colors;
+        private readonly List<Material> _tileMaterials = new List<Material>();
 
         private async void Start()
         {
@@ -122,9 +123,14 @@ namespace CityModel.Samples
             ValidateFeatureIds(decoded.FeatureIds, buildingIds, loadedTile.Metadata.tileId);
             tile.AddComponent<MeshFilter>().sharedMesh = decoded.Mesh;
             var renderer = tile.AddComponent<MeshRenderer>();
-            renderer.sharedMaterial = _material;
             _colors.RegisterTile(loadedTile.Metadata.tileId, buildingIds);
-            _colors.ApplyToRenderer(loadedTile.Metadata.tileId, renderer);
+            var tileMaterial = new Material(_material)
+            {
+                name = _material.name + " (" + loadedTile.Metadata.tileId + ")",
+            };
+            _colors.ApplyToMaterial(loadedTile.Metadata.tileId, tileMaterial);
+            renderer.sharedMaterial = tileMaterial;
+            _tileMaterials.Add(tileMaterial);
         }
 
         private static void ValidateFeatureIds(IReadOnlyList<ushort> featureIds, IReadOnlyList<string> buildingIds, string tileId)
@@ -149,6 +155,8 @@ namespace CityModel.Samples
             _cancellation?.Dispose();
             _dataset?.Dispose();
             _colors?.Dispose();
+            foreach (var tileMaterial in _tileMaterials) Destroy(tileMaterial);
+            _tileMaterials.Clear();
             if (_tilesRoot != null) Destroy(_tilesRoot);
             if (_material != null) Destroy(_material);
         }

@@ -20,18 +20,24 @@ namespace CityModel.Coloring
         public ColorUpdateResult SetColor(string buildingId, Color32 color) { _colors[buildingId] = color; var found = false; foreach (var table in _tiles.Values) found |= table.TrySet(buildingId, color); return found ? ColorUpdateResult.Applied : ColorUpdateResult.Deferred; }
         public void ClearColor(string buildingId) { _colors.Remove(buildingId); foreach (var table in _tiles.Values) table.TrySet(buildingId, _defaultColor); }
         public void ClearAll() { _colors.Clear(); foreach (var table in _tiles.Values) table.Reset(_defaultColor); }
-        public void RegisterTile(string tileId, IReadOnlyList<string> buildingIds) { var table = new TileColorTable(buildingIds, _defaultColor); foreach (var pair in _colors) table.TrySet(pair.Key, pair.Value); _tiles[tileId] = table; }
-        /// <summary>Binds this tile's Feature ID color table to a renderer using CityModel/Feature Colors.</summary>
-        public void ApplyToRenderer(string tileId, Renderer renderer)
+        public void RegisterTile(string tileId, IReadOnlyList<string> buildingIds)
         {
-            if (renderer == null) throw new ArgumentNullException(nameof(renderer));
+            if (tileId == null) throw new ArgumentNullException(nameof(tileId));
+            if (buildingIds == null) throw new ArgumentNullException(nameof(buildingIds));
+            var table = new TileColorTable(buildingIds, _defaultColor);
+            foreach (var pair in _colors) table.TrySet(pair.Key, pair.Value);
+            if (_tiles.Remove(tileId, out var previous)) previous.Dispose();
+            _tiles.Add(tileId, table);
+        }
+
+        /// <summary>Binds this tile's Feature ID color table directly to its dedicated material.</summary>
+        public void ApplyToMaterial(string tileId, Material material)
+        {
+            if (material == null) throw new ArgumentNullException(nameof(material));
             if (!_tiles.TryGetValue(tileId, out var table)) throw new KeyNotFoundException("Tile color table is not registered: " + tileId);
-            var properties = new MaterialPropertyBlock();
-            renderer.GetPropertyBlock(properties);
-            properties.SetBuffer(FeatureColorsId, table.Buffer);
-            properties.SetInt(FeatureColorCountId, table.Count);
-            properties.SetColor(DefaultColorId, _defaultColor);
-            renderer.SetPropertyBlock(properties);
+            material.SetBuffer(FeatureColorsId, table.Buffer);
+            material.SetInt(FeatureColorCountId, table.Count);
+            material.SetColor(DefaultColorId, _defaultColor);
         }
         public void UnregisterTile(string tileId) { if (_tiles.Remove(tileId, out var table)) table.Dispose(); }
         public void Dispose() { foreach (var table in _tiles.Values) table.Dispose(); _tiles.Clear(); }
