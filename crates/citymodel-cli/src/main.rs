@@ -584,7 +584,8 @@ fn write_tiles(
             triangle_count,
         });
         let metadata_output = metadata::write_json_under(output, &metadata_path, &metadata_json)?;
-        let metadata_byte_length = fs::metadata(&metadata_output)?.len() as usize;
+        let metadata_byte_length = usize::try_from(fs::metadata(&metadata_output)?.len())
+            .map_err(|_| std::io::Error::other("tile metadata exceeds supported size"))?;
         let metadata_sha256 = sha256_file(&metadata_output)?;
         outputs.push(TileOutput {
             id,
@@ -888,6 +889,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn converts_lod1_fixture_to_a_unity_dataset() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../citymodel-citygml/tests/fixtures/plateau-lod1-small.gml");
@@ -904,8 +906,8 @@ mod tests {
         assert_eq!(content_index["featureType"], "building");
         assert_eq!(content_index["metadata"], metadata);
         assert_eq!(
-            content_index["byteLength"].as_u64().unwrap() as usize,
-            fs::metadata(output.join(metadata)).unwrap().len() as usize
+            usize::try_from(content_index["byteLength"].as_u64().unwrap()).unwrap(),
+            usize::try_from(fs::metadata(output.join(metadata)).unwrap().len()).unwrap()
         );
         assert_eq!(
             content_index["sha256"],
