@@ -1284,16 +1284,17 @@ fn write_database(
     issues: &[ConversionIssue],
     origin: Point3,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = create_database(path)?;
+    let mut connection = create_database(path)?;
     connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let transaction = connection.transaction()?;
     let placeholder = "0".repeat(64);
-    connection.execute("INSERT INTO dataset_metadata (dataset_id, schema_version, generation_id, generated_at, generator_name, generator_version, source_crs_epsg, source_crs_wkt, working_crs_epsg, working_crs_wkt, vertical_crs_epsg, vertical_reference_type, axis_order_json, dataset_origin_latitude, dataset_origin_longitude, dataset_origin_height, dataset_origin_geographic_epsg, dataset_origin_x, dataset_origin_y, dataset_origin_z, manifest_sha256, database_sha256, conversion_config_json, license_json) VALUES (?1, '1.0.0', ?2, '1970-01-01T00:00:00Z', 'citymodel', '0.1.0-dev', 6697, NULL, 3857, NULL, NULL, 'source-defined', '[\"latitude\",\"longitude\",\"height\"]', 0.0, 0.0, 0.0, 4326, ?3, ?4, ?5, ?6, ?6, '{}', '{}')", params![dataset_id, generation_id, origin.x, origin.y, origin.z, placeholder])?;
+    transaction.execute("INSERT INTO dataset_metadata (dataset_id, schema_version, generation_id, generated_at, generator_name, generator_version, source_crs_epsg, source_crs_wkt, working_crs_epsg, working_crs_wkt, vertical_crs_epsg, vertical_reference_type, axis_order_json, dataset_origin_latitude, dataset_origin_longitude, dataset_origin_height, dataset_origin_geographic_epsg, dataset_origin_x, dataset_origin_y, dataset_origin_z, manifest_sha256, database_sha256, conversion_config_json, license_json) VALUES (?1, '1.0.0', ?2, '1970-01-01T00:00:00Z', 'citymodel', '0.1.0-dev', 6697, NULL, 3857, NULL, NULL, 'source-defined', '[\"latitude\",\"longitude\",\"height\"]', 0.0, 0.0, 0.0, 4326, ?3, ?4, ?5, ?6, ?6, '{}', '{}')", params![dataset_id, generation_id, origin.x, origin.y, origin.z, placeholder])?;
     for (id, file, sha256, length) in source_files {
-        connection.execute("INSERT INTO source_files (source_file_id, dataset_id, relative_path, sha256, byte_length) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, dataset_id, file.file_name().and_then(|name| name.to_str()).unwrap_or("input.gml"), sha256, length])?;
+        transaction.execute("INSERT INTO source_files (source_file_id, dataset_id, relative_path, sha256, byte_length) VALUES (?1, ?2, ?3, ?4, ?5)", params![id, dataset_id, file.file_name().and_then(|name| name.to_str()).unwrap_or("input.gml"), sha256, length])?;
     }
     for tile in tiles {
-        connection.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.0, 0.0, 0.0, 4326, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, '[]', ?21, 0, ?22, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.building_ids.len() as i64, tile.triangle_count as i64])?;
-        connection.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'building', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
+        transaction.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.0, 0.0, 0.0, 4326, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, '[]', ?21, 0, ?22, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.building_ids.len() as i64, tile.triangle_count as i64])?;
+        transaction.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'building', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
     }
     for tile in terrain_tiles {
         if !tiles
@@ -1301,19 +1302,19 @@ fn write_database(
             .any(|building_tile| building_tile.id == tile.id)
         {
             let geographic = inverse_web_mercator(tile.origin);
-            connection.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 4326, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, '[]', 0, 0, ?24, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, geographic.0, geographic.1, tile.origin.z, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.triangle_count as i64])?;
+            transaction.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 4326, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, '[]', 0, 0, ?24, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, geographic.0, geographic.1, tile.origin.z, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.triangle_count as i64])?;
         }
-        connection.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'terrain', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
+        transaction.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'terrain', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
         for (feature_id, source_file_id, local_feature_id) in &tile.feature_assignments {
             let canonical = format!("{dataset_id}::{feature_id}");
-            connection.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'terrain', ?1, 'gml', 0, ?3)", params![feature_id, canonical, source_file_id])?;
-            connection.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'terrain', ?2, ?3)", params![tile.id, i64::from(*local_feature_id), feature_id])?;
+            transaction.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'terrain', ?1, 'gml', 0, ?3)", params![feature_id, canonical, source_file_id])?;
+            transaction.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'terrain', ?2, ?3)", params![tile.id, i64::from(*local_feature_id), feature_id])?;
         }
     }
     for assignment in assignments {
         let canonical = format!("{dataset_id}::{}", assignment.building_id);
         insert_building(
-            &connection,
+            &transaction,
             &BuildingRow {
                 building_id: &assignment.building_id,
                 canonical_building_id: &canonical,
@@ -1324,29 +1325,41 @@ fn write_database(
             },
         )?;
         let attributes_json = attributes_json(&assignment.attributes);
-        connection.execute("UPDATE buildings SET tile_id=?1, local_feature_id=?2, lod_used=?3, centroid_x=?4, centroid_y=?5, attributes_json=?6 WHERE building_id=?7", params![assignment.tile_id, i64::from(assignment.feature_id), i64::from(assignment.lod_used), assignment.centroid.x, assignment.centroid.y, attributes_json, assignment.building_id])?;
-        connection.execute("INSERT INTO tile_features (tile_id, local_feature_id, building_id, building_part_id) VALUES (?1, ?2, ?3, NULL)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
-        connection.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'building', ?1, 'gml', 0, ?3)", params![assignment.building_id, canonical, assignment.source_file_id])?;
-        connection.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'building', ?2, ?3)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
-        insert_attributes(&connection, &assignment.building_id, &assignment.attributes)?;
-        insert_feature_attributes(&connection, &assignment.building_id, &assignment.attributes)?;
+        transaction.execute("UPDATE buildings SET tile_id=?1, local_feature_id=?2, lod_used=?3, centroid_x=?4, centroid_y=?5, attributes_json=?6 WHERE building_id=?7", params![assignment.tile_id, i64::from(assignment.feature_id), i64::from(assignment.lod_used), assignment.centroid.x, assignment.centroid.y, attributes_json, assignment.building_id])?;
+        transaction.execute("INSERT INTO tile_features (tile_id, local_feature_id, building_id, building_part_id) VALUES (?1, ?2, ?3, NULL)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
+        transaction.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'building', ?1, 'gml', 0, ?3)", params![assignment.building_id, canonical, assignment.source_file_id])?;
+        transaction.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'building', ?2, ?3)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
+        insert_attributes(
+            &transaction,
+            &assignment.building_id,
+            &assignment.attributes,
+        )?;
+        insert_feature_attributes(
+            &transaction,
+            &assignment.building_id,
+            &assignment.attributes,
+        )?;
     }
     for issue in issues {
-        connection.execute(
+        transaction.execute(
             "INSERT INTO conversion_issues (source_file_id, building_id, gml_id, severity, error_code, message, element_path, repaired, exclusion_reason, occurred_at) VALUES (?1, ?2, ?2, 'warn', ?3, ?4, NULL, 0, NULL, '1970-01-01T00:00:00Z')",
             params![issue.source_file_id, issue.building_id, format!("{:?}", issue.diagnostic.kind), issue.diagnostic.message],
         )?;
     }
+    transaction.commit()?;
     verify_integrity(&connection)?;
     Ok(())
 }
 
 fn insert_attributes(
-    connection: &rusqlite::Connection,
+    transaction: &rusqlite::Transaction<'_>,
     building_id: &str,
     attributes: &[BuildingAttribute],
 ) -> rusqlite::Result<()> {
     let mut ordinals = BTreeMap::<(String, String), i64>::new();
+    let mut statement = transaction.prepare_cached(
+        "INSERT INTO building_attributes (building_id, namespace_uri, attribute_path, attribute_key, ordinal, value_type, value_text, value_real, value_integer, value_boolean, value_datetime, uom, code_space, nil_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11)",
+    )?;
     for attribute in attributes {
         let key = (
             attribute.namespace_uri.clone(),
@@ -1357,21 +1370,33 @@ fn insert_attributes(
             AttributeValue::Code(value) => ("code", Some(value.as_str()), None),
             AttributeValue::Real(value) => ("real", None, Some(*value)),
         };
-        connection.execute(
-            "INSERT INTO building_attributes (building_id, namespace_uri, attribute_path, attribute_key, ordinal, value_type, value_text, value_real, value_integer, value_boolean, value_datetime, uom, code_space, nil_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11)",
-            params![building_id, attribute.namespace_uri, attribute.attribute_path, attribute.attribute_key, *ordinal, value_type, value_text, value_real, attribute.uom, attribute.code_space, attribute.nil_reason],
-        )?;
+        statement.execute(params![
+            building_id,
+            attribute.namespace_uri,
+            attribute.attribute_path,
+            attribute.attribute_key,
+            *ordinal,
+            value_type,
+            value_text,
+            value_real,
+            attribute.uom,
+            attribute.code_space,
+            attribute.nil_reason
+        ])?;
         *ordinal += 1;
     }
     Ok(())
 }
 
 fn insert_feature_attributes(
-    connection: &rusqlite::Connection,
+    transaction: &rusqlite::Transaction<'_>,
     feature_id: &str,
     attributes: &[BuildingAttribute],
 ) -> rusqlite::Result<()> {
     let mut ordinals = BTreeMap::<(String, String), i64>::new();
+    let mut statement = transaction.prepare_cached(
+        "INSERT INTO feature_attributes (feature_id, namespace_uri, attribute_path, attribute_key, ordinal, value_type, value_text, value_real, value_integer, value_boolean, value_datetime, uom, code_space, nil_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11)",
+    )?;
     for attribute in attributes {
         let key = (
             attribute.namespace_uri.clone(),
@@ -1382,10 +1407,19 @@ fn insert_feature_attributes(
             AttributeValue::Code(value) => ("code", Some(value.as_str()), None),
             AttributeValue::Real(value) => ("real", None, Some(*value)),
         };
-        connection.execute(
-            "INSERT INTO feature_attributes (feature_id, namespace_uri, attribute_path, attribute_key, ordinal, value_type, value_text, value_real, value_integer, value_boolean, value_datetime, uom, code_space, nil_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11)",
-            params![feature_id, attribute.namespace_uri, attribute.attribute_path, attribute.attribute_key, *ordinal, value_type, value_text, value_real, attribute.uom, attribute.code_space, attribute.nil_reason],
-        )?;
+        statement.execute(params![
+            feature_id,
+            attribute.namespace_uri,
+            attribute.attribute_path,
+            attribute.attribute_key,
+            *ordinal,
+            value_type,
+            value_text,
+            value_real,
+            attribute.uom,
+            attribute.code_space,
+            attribute.nil_reason
+        ])?;
         *ordinal += 1;
     }
     Ok(())
