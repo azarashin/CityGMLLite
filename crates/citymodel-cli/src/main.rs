@@ -128,6 +128,17 @@ struct ConversionIssue {
     diagnostic: Diagnostic,
 }
 
+#[derive(Clone, Debug)]
+struct InputFileBreakdown {
+    relative_path: String,
+    byte_length: u64,
+    parsing_elapsed_ms: u128,
+    raw_buildings: usize,
+    raw_terrain_features: usize,
+    terrain_texture_declarations: usize,
+    diagnostics: usize,
+}
+
 fn main() -> ExitCode {
     match parse_command(env::args().skip(1)) {
         Ok(command) => run(command),
@@ -275,21 +286,64 @@ fn convert(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total_started = Instant::now();
     let stage_started = Instant::now();
+    status_stage_started("input discovery and hashing");
     let files = discover_input_files(input).map_err(diagnostic_error)?;
     if files.is_empty() {
         return Err("no CityGML files found".into());
     }
+    let input_root = input_root(input)?;
+    let input_file_sizes = files
+        .iter()
+        .map(|file| Ok((file.path.clone(), fs::metadata(&file.path)?.len())))
+        .collect::<Result<BTreeMap<_, _>, std::io::Error>>()?;
+    let total_input_bytes = input_file_sizes.values().sum::<u64>();
+    eprintln!(
+        "[citymodel] input files: {} ({} bytes)",
+        files.len(),
+        total_input_bytes
+    );
+    for (index, file) in files.iter().enumerate() {
+        let bytes = input_file_sizes
+            .get(&file.path)
+            .copied()
+            .ok_or("input file size missing")?;
+        eprintln!(
+            "[citymodel] input [{}/{}] {} ({} bytes)",
+            index + 1,
+            files.len(),
+            input_relative_path(&file.path, input_root).display(),
+            bytes
+        );
+    }
     let dataset_id = dataset_id(input);
     let generation_id = format!("gen-{}", &combined_digest(&files)[..16]);
     let discovery_elapsed_ms = elapsed_ms(stage_started);
+    status_stage_finished("input discovery and hashing", discovery_elapsed_ms);
     let mut buildings = Vec::new();
     let mut terrain = Vec::new();
     let mut terrain_textures = Vec::new();
     let mut source_files = Vec::new();
     let mut issues = Vec::new();
+    let mut input_file_breakdown = Vec::new();
     let stage_started = Instant::now();
+    status_stage_started("CityGML parsing and extraction");
     for (index, file) in files.iter().enumerate() {
         let source_file_id = i64::try_from(index + 1).map_err(|_| "too many input files")?;
+        let byte_length = input_file_sizes
+            .get(&file.path)
+            .copied()
+            .ok_or("input file size missing")?;
+        let relative_path = input_relative_path(&file.path, input_root)
+            .to_string_lossy()
+            .into_owned();
+        let file_started = Instant::now();
+        eprintln!(
+            "[citymodel] parsing [{}/{}] started: {} ({} bytes)",
+            index + 1,
+            files.len(),
+            relative_path,
+            byte_length
+        );
         let report = parse_file(file.clone(), InputLimits::default());
         if mode == Mode::Strict && !report.diagnostics.is_empty() {
             return Err(format!(
@@ -316,19 +370,43 @@ fn convert(
             source_file_id,
             file.path.clone(),
             file.sha256.clone(),
-            fs::metadata(&file.path)?.len(),
+            byte_length,
         ));
-        buildings.extend(extract_buildings(&report.events, source_file_id));
+        let file_buildings = extract_buildings(&report.events, source_file_id);
         let (file_terrain, file_textures) = extract_terrain(&report.events, source_file_id);
+        let file_elapsed_ms = elapsed_ms(file_started);
+        eprintln!(
+            "[citymodel] parsing [{}/{}] finished: {} ({} ms; buildings: {}, terrain: {}, textures: {}, diagnostics: {})",
+            index + 1,
+            files.len(),
+            relative_path,
+            file_elapsed_ms,
+            file_buildings.len(),
+            file_terrain.len(),
+            file_textures.len(),
+            report.diagnostics.len()
+        );
+        input_file_breakdown.push(InputFileBreakdown {
+            relative_path,
+            byte_length,
+            parsing_elapsed_ms: file_elapsed_ms,
+            raw_buildings: file_buildings.len(),
+            raw_terrain_features: file_terrain.len(),
+            terrain_texture_declarations: file_textures.len(),
+            diagnostics: report.diagnostics.len(),
+        });
+        buildings.extend(file_buildings);
         terrain.extend(file_terrain);
         terrain_textures.extend(file_textures);
     }
     let parsing_elapsed_ms = elapsed_ms(stage_started);
+    status_stage_finished("CityGML parsing and extraction", parsing_elapsed_ms);
     let raw_building_count = buildings.len();
     let raw_terrain_count = terrain.len();
     let terrain_texture_declaration_count = terrain_textures.len();
 
     let stage_started = Instant::now();
+    status_stage_started("building geometry preparation");
     let prepared = prepare_buildings(buildings, max_lod, mode, &mut issues)
         .map_err(|error| stage_error("building geometry preparation", error))?;
     let building_triangle_count = prepared
@@ -336,17 +414,16 @@ fn convert(
         .map(|building| building.triangles.len())
         .sum::<usize>();
     let preparation_elapsed_ms = elapsed_ms(stage_started);
+    status_stage_finished("building geometry preparation", preparation_elapsed_ms);
 
     let stage_started = Instant::now();
+    status_stage_started("building GLB tile generation");
     let (tile_outputs, assignments) = write_tiles(output, &generation_id, prepared)
         .map_err(|error| stage_error("building GLB tile write", error))?;
     let building_glb_elapsed_ms = elapsed_ms(stage_started);
-    let input_root = if input.is_file() {
-        input.parent().ok_or("input file has no parent")?
-    } else {
-        input
-    };
+    status_stage_finished("building GLB tile generation", building_glb_elapsed_ms);
     let stage_started = Instant::now();
+    status_stage_started("terrain GLB tile generation");
     let terrain_outputs = write_terrain_tiles(
         output,
         &generation_id,
@@ -356,6 +433,7 @@ fn convert(
     )
     .map_err(|error| stage_error("terrain GLB tile write", error))?;
     let terrain_glb_elapsed_ms = elapsed_ms(stage_started);
+    status_stage_finished("terrain GLB tile generation", terrain_glb_elapsed_ms);
     if tile_outputs.is_empty() && terrain_outputs.is_empty() {
         return Err(format!(
             "no building or textured terrain geometry was found at or below LOD{max_lod}"
@@ -373,6 +451,7 @@ fn convert(
         });
     let database_path = output.join("citymodel.sqlite");
     let stage_started = Instant::now();
+    status_stage_started("SQLite write");
     write_database(
         &database_path,
         &dataset_id,
@@ -386,15 +465,19 @@ fn convert(
     )
     .map_err(|error| stage_error("SQLite write", error))?;
     let sqlite_write_elapsed_ms = elapsed_ms(stage_started);
+    status_stage_finished("SQLite write", sqlite_write_elapsed_ms);
     let database_byte_length = fs::metadata(&database_path)?.len();
     let database_row_counts = database_row_counts(&database_path)?;
 
     let stage_started = Instant::now();
+    status_stage_started("database hash");
     let database_sha256 =
         sha256_file(&database_path).map_err(|error| stage_error("database hash", error))?;
     let database_hash_elapsed_ms = elapsed_ms(stage_started);
+    status_stage_finished("database hash", database_hash_elapsed_ms);
 
     let stage_started = Instant::now();
+    status_stage_started("manifest write");
     write_manifest(
         output,
         &dataset_id,
@@ -408,6 +491,7 @@ fn convert(
     )
     .map_err(|error| stage_error("manifest write", error))?;
     let manifest_write_elapsed_ms = elapsed_ms(stage_started);
+    status_stage_finished("manifest write", manifest_write_elapsed_ms);
 
     let building_glb_byte_length = tile_outputs
         .iter()
@@ -435,6 +519,15 @@ fn convert(
             "mode":format!("{mode:?}"),
             "maxLod":max_lod,
             "totalElapsedMs": elapsed_ms(total_started),
+            "inputFiles": input_file_breakdown.iter().map(|file| json!({
+                "relativePath": file.relative_path,
+                "byteLength": file.byte_length,
+                "parsingElapsedMs": file.parsing_elapsed_ms,
+                "rawBuildings": file.raw_buildings,
+                "rawTerrainFeatures": file.raw_terrain_features,
+                "terrainTextureDeclarations": file.terrain_texture_declarations,
+                "diagnostics": file.diagnostics
+            })).collect::<Vec<_>>(),
             "stages": {
                 "inputDiscoveryAndHashing": {"elapsedMs": discovery_elapsed_ms, "inputFiles": files.len()},
                 "parsingAndExtraction": {"elapsedMs": parsing_elapsed_ms, "inputBytes": source_files.iter().map(|(_, _, _, length)| length).sum::<u64>(), "rawBuildings": raw_building_count, "rawTerrainFeatures": raw_terrain_count, "terrainTextureDeclarations": terrain_texture_declaration_count, "diagnostics": issues.len()},
@@ -448,6 +541,11 @@ fn convert(
             }
         }))?,
     )?;
+    eprintln!(
+        "[citymodel] conversion finished: {} ms; report: {}",
+        elapsed_ms(total_started),
+        report_path.display()
+    );
     Ok(())
 }
 
@@ -779,8 +877,9 @@ fn write_terrain_tiles(
                 ));
         }
     }
+    let tile_count = grouped.len();
     let mut outputs = Vec::new();
-    for (grid, rings) in grouped {
+    for (index, (grid, rings)) in grouped.into_iter().enumerate() {
         let id = format!("t_{}_{}_{}", grid.level, grid.x, grid.y);
         let origin = Point3 {
             x: grid.x as f64 * DEFAULT_TILE_SIZE_METERS,
@@ -933,6 +1032,13 @@ fn write_terrain_tiles(
                 ))
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        eprintln!(
+            "[citymodel] terrain tile [{}/{}] finished: {} ({} triangles)",
+            index + 1,
+            tile_count,
+            id,
+            triangles.len()
+        );
         outputs.push(TerrainTileOutput {
             id,
             feature_assignments,
@@ -973,9 +1079,10 @@ fn write_tiles(
             .or_default()
             .push(building);
     }
+    let tile_count = grouped.len();
     let mut outputs = Vec::new();
     let mut assignments = Vec::new();
-    for (grid, mut buildings) in grouped {
+    for (index, (grid, mut buildings)) in grouped.into_iter().enumerate() {
         buildings.sort_by(|left, right| left.id.cmp(&right.id));
         let id = format!("t_{}_{}_{}", grid.level, grid.x, grid.y);
         let origin = Point3 {
@@ -1073,6 +1180,14 @@ fn write_tiles(
         let metadata_byte_length = usize::try_from(fs::metadata(&metadata_output)?.len())
             .map_err(|_| std::io::Error::other("tile metadata exceeds supported size"))?;
         let metadata_sha256 = sha256_file(&metadata_output)?;
+        eprintln!(
+            "[citymodel] building tile [{}/{}] finished: {} ({} buildings, {} triangles)",
+            index + 1,
+            tile_count,
+            id,
+            building_ids.len(),
+            triangle_count
+        );
         outputs.push(TileOutput {
             id,
             building_ids,
@@ -1331,6 +1446,29 @@ fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
 }
 
+fn input_root(input: &Path) -> Result<&Path, Box<dyn std::error::Error>> {
+    if input.is_file() {
+        input.parent().ok_or("input file has no parent".into())
+    } else {
+        Ok(input)
+    }
+}
+
+fn input_relative_path<'a>(path: &'a Path, input_root: &Path) -> &'a Path {
+    path.strip_prefix(input_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(path)
+}
+
+fn status_stage_started(stage: &str) {
+    eprintln!("[citymodel] {stage}: started");
+}
+
+fn status_stage_finished(stage: &str, elapsed_ms: u128) {
+    eprintln!("[citymodel] {stage}: finished ({elapsed_ms} ms)");
+}
+
 fn stage_error(stage: &str, error: impl std::fmt::Display) -> Box<dyn std::error::Error> {
     std::io::Error::other(format!("{stage} failed: {error}")).into()
 }
@@ -1538,6 +1676,21 @@ mod tests {
             conversion_report["stages"]["inputDiscoveryAndHashing"]["inputFiles"],
             1
         );
+        let input_files = conversion_report["inputFiles"].as_array().unwrap();
+        assert_eq!(input_files.len(), 1);
+        assert_eq!(
+            input_files[0]["relativePath"],
+            fixture.file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            input_files[0]["byteLength"],
+            fs::metadata(&fixture).unwrap().len()
+        );
+        assert_eq!(
+            conversion_report["stages"]["parsingAndExtraction"]["inputBytes"],
+            fs::metadata(&fixture).unwrap().len()
+        );
+        assert_eq!(input_files[0]["rawBuildings"], 1);
         assert_eq!(
             conversion_report["stages"]["parsingAndExtraction"]["rawBuildings"],
             1
