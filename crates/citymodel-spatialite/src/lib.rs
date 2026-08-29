@@ -1,6 +1,6 @@
 //! Direct `SQLite` writer boundary for `CityGML` conversion output.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, params};
 use std::path::Path;
 
 pub const MODULE_NAME: &str = "citymodel-spatialite";
@@ -40,8 +40,11 @@ pub fn create_database(path: &Path) -> rusqlite::Result<Connection> {
 /// # Errors
 ///
 /// Returns the database uniqueness error rather than overwriting a building.
-pub fn insert_building(connection: &Connection, row: &BuildingRow<'_>) -> rusqlite::Result<()> {
-    connection.execute("INSERT INTO buildings (building_id, canonical_building_id, gml_id, id_source, id_is_synthetic, source_file_id, tile_id, local_feature_id, lod_used, lod_generated, centroid_x, centroid_y, footprint_quality) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unassigned', 0, 1, 0, 0.0, 0.0, 'source')", params![row.building_id, row.canonical_building_id, row.gml_id, row.id_source, row.id_is_synthetic, row.source_file_id])?;
+pub fn insert_building(
+    transaction: &Transaction<'_>,
+    row: &BuildingRow<'_>,
+) -> rusqlite::Result<()> {
+    transaction.execute("INSERT INTO buildings (building_id, canonical_building_id, gml_id, id_source, id_is_synthetic, source_file_id, tile_id, local_feature_id, lod_used, lod_generated, centroid_x, centroid_y, footprint_quality) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unassigned', 0, 1, 0, 0.0, 0.0, 'source')", params![row.building_id, row.canonical_building_id, row.gml_id, row.id_source, row.id_is_synthetic, row.source_file_id])?;
     Ok(())
 }
 
@@ -64,7 +67,7 @@ mod tests {
     use super::*;
     #[test]
     fn creates_indexed_database_and_rejects_duplicates() {
-        let connection = Connection::open_in_memory().unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(INITIAL_SCHEMA).unwrap();
         connection.execute_batch(COMMON_FEATURES_SCHEMA).unwrap();
         connection
@@ -78,8 +81,40 @@ mod tests {
             id_source: "gml",
             id_is_synthetic: false,
         };
-        insert_building(&connection, &row).unwrap();
-        assert!(insert_building(&connection, &row).is_err());
+        let transaction = connection.transaction().unwrap();
+        insert_building(&transaction, &row).unwrap();
+        assert!(insert_building(&transaction, &row).is_err());
+        transaction.commit().unwrap();
         verify_integrity(&connection).unwrap();
+    }
+
+    #[test]
+    fn rolls_back_buildings_when_a_transaction_fails() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(INITIAL_SCHEMA).unwrap();
+        connection.execute_batch(COMMON_FEATURES_SCHEMA).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        connection
+            .execute_batch("INSERT INTO dataset_metadata (dataset_id, schema_version, generation_id, generated_at, generator_name, generator_version, source_crs_epsg, working_crs_epsg, vertical_reference_type, axis_order_json, dataset_origin_latitude, dataset_origin_longitude, dataset_origin_height, dataset_origin_geographic_epsg, dataset_origin_x, dataset_origin_y, dataset_origin_z, manifest_sha256, database_sha256, conversion_config_json, license_json) VALUES ('dataset', '1.0.0', 'generation', '1970-01-01T00:00:00Z', 'test', '0', 6697, 3857, 'source-defined', '[]', 0, 0, 0, 4326, 0, 0, 0, '0000000000000000000000000000000000000000000000000000000000000000', '0000000000000000000000000000000000000000000000000000000000000000', '{}', '{}');")
+            .unwrap();
+        let row = BuildingRow {
+            building_id: "b",
+            canonical_building_id: "dataset::b",
+            gml_id: Some("g"),
+            source_file_id: 1,
+            id_source: "gml",
+            id_is_synthetic: false,
+        };
+        {
+            let transaction = connection.transaction().unwrap();
+            insert_building(&transaction, &row).unwrap();
+            assert!(insert_building(&transaction, &row).is_err());
+        }
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM buildings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
