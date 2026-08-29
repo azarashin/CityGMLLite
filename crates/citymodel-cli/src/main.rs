@@ -4,8 +4,8 @@
 mod metadata;
 
 use citymodel_citygml::{
-    AttributeValue, AxisOrder, BuildingAttribute, Diagnostic, FeatureType, InputLimits,
-    ParserEvent, TerrainTexture as ParsedTerrainTexture, discover_input_files,
+    AttributeValue, AxisOrder, BuildingAttribute, Diagnostic, DiagnosticKind, FeatureType,
+    InputLimits, ParserEvent, TerrainTexture as ParsedTerrainTexture, discover_input_files,
     discover_input_paths, hash_input_file, parse_file,
 };
 use citymodel_coordinate::Point3;
@@ -16,6 +16,8 @@ use citymodel_gltf::{
 };
 use citymodel_spatialite::{BuildingRow, create_database, insert_building, verify_integrity};
 use citymodel_tiling::{DEFAULT_TILE_SIZE_METERS, TileId, tile_for_point};
+use quick_xml::Reader;
+use quick_xml::events::Event;
 use rusqlite::params;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -24,12 +26,16 @@ use std::{
     env,
     fmt::Write as _,
     fs,
+    io::Cursor,
     path::{Path, PathBuf},
     process::ExitCode,
     time::Instant,
 };
 
 const WORKING_EPSG: u32 = 3857;
+const MAX_TERRAIN_TEXTURE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TERRAIN_TEXTURE_DECODED_RGBA_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ENVELOPE_CORNER_TEXT_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -70,6 +76,23 @@ struct RawTerrainRing {
     values: Vec<f64>,
     dimension: usize,
     axis_order: AxisOrder,
+}
+#[derive(Clone, Copy, Debug)]
+struct GeographicEnvelope {
+    south: f64,
+    west: f64,
+    north: f64,
+    east: f64,
+}
+#[derive(Clone, Debug)]
+struct TerrainTextureDeclaration {
+    source_file_id: i64,
+    texture: ParsedTerrainTexture,
+}
+#[derive(Clone, Debug)]
+struct TerrainMapTexture {
+    image_uri: String,
+    envelope: GeographicEnvelope,
 }
 #[derive(Clone, Debug)]
 struct TerrainTileOutput {
@@ -349,6 +372,7 @@ fn convert(
     let mut buildings = Vec::new();
     let mut terrain = Vec::new();
     let mut terrain_textures = Vec::new();
+    let mut terrain_envelopes = BTreeMap::new();
     let mut source_files = Vec::new();
     let mut issues = Vec::new();
     let mut input_file_breakdown = Vec::new();
@@ -401,6 +425,7 @@ fn convert(
         ));
         let file_buildings = extract_buildings(&report.events, source_file_id);
         let (file_terrain, file_textures) = extract_terrain(&report.events, source_file_id);
+        let file_envelope = geographic_envelope_from_file(&file.path).ok().flatten();
         let file_elapsed_ms = elapsed_ms(file_started);
         eprintln!(
             "[citymodel] parsing [{}/{}] finished: {} ({} ms; buildings: {}, terrain: {}, textures: {}, diagnostics: {})",
@@ -424,7 +449,15 @@ fn convert(
         });
         buildings.extend(file_buildings);
         terrain.extend(file_terrain);
-        terrain_textures.extend(file_textures);
+        terrain_textures.extend(file_textures.into_iter().map(|texture| {
+            TerrainTextureDeclaration {
+                source_file_id,
+                texture,
+            }
+        }));
+        if let Some(envelope) = file_envelope {
+            terrain_envelopes.insert(source_file_id, envelope);
+        }
     }
     let parsing_elapsed_ms = elapsed_ms(stage_started);
     status_stage_finished("CityGML parsing and extraction", parsing_elapsed_ms);
@@ -457,6 +490,9 @@ fn convert(
         terrain,
         terrain_textures,
         input_root,
+        &source_files,
+        &terrain_envelopes,
+        &mut issues,
     )
     .map_err(|error| stage_error("terrain GLB tile write", error))?;
     let terrain_glb_elapsed_ms = elapsed_ms(stage_started);
@@ -545,6 +581,22 @@ fn convert(
     let report_started = Instant::now();
     let report_path = output.join("conversion.report.json");
     let total_elapsed_ms = elapsed_ms(total_started);
+    let terrain_texture_fallbacks = issues
+        .iter()
+        .filter(|issue| {
+            issue
+                .diagnostic
+                .message
+                .starts_with("terrain map texture fallback")
+        })
+        .map(|issue| {
+            json!({
+                "sourceFileId": issue.source_file_id,
+                "featureId": issue.building_id,
+                "message": issue.diagnostic.message,
+            })
+        })
+        .collect::<Vec<_>>();
     let summary = conversion_summary(
         total_elapsed_ms,
         &stage_elapsed_ms,
@@ -570,6 +622,7 @@ fn convert(
             "sourceFiles":source_files.len(),
             "buildings":assignments.len(),
             "terrainTiles":terrain_outputs.len(),
+            "terrainTextureFallbacks": terrain_texture_fallbacks,
             "tiles":tile_outputs.len(),
             "mode":format!("{mode:?}"),
             "maxLod":max_lod,
@@ -695,10 +748,12 @@ fn extract_terrain(
                 rings: Vec::new(),
             }),
             ParserEvent::Coordinates(sequence) if sequence.is_linear_ring => {
-                if let (Some(terrain), Some(surface_id)) = (active.last_mut(), &sequence.surface_id)
-                {
+                if let Some(terrain) = active.last_mut() {
+                    let surface_id = sequence.surface_id.clone().unwrap_or_else(|| {
+                        format!("{}:terrain-surface-{}", terrain.id, terrain.rings.len() + 1)
+                    });
                     terrain.rings.push(RawTerrainRing {
-                        surface_id: surface_id.clone(),
+                        surface_id,
                         values: sequence.values.clone(),
                         dimension: usize::from(sequence.dimension.unwrap_or(3)),
                         axis_order: sequence.axis_order,
@@ -719,6 +774,71 @@ fn extract_terrain(
         }
     }
     (output, textures)
+}
+
+fn geographic_envelope_from_file(
+    path: &Path,
+) -> Result<Option<GeographicEnvelope>, Box<dyn std::error::Error>> {
+    let mut reader = Reader::from_file(path)?;
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut active_corner = None::<(&str, String)>;
+    let mut lower = None;
+    let mut upper = None;
+    loop {
+        match reader.read_event_into(&mut buffer)? {
+            Event::Start(element) => match element.local_name().as_ref() {
+                "lowerCorner" => active_corner = Some(("lower", String::new())),
+                "upperCorner" => active_corner = Some(("upper", String::new())),
+                _ => {}
+            },
+            Event::Text(text) => {
+                if let Some((_, value)) = &mut active_corner {
+                    if value.len() + text.as_ref().len() > MAX_ENVELOPE_CORNER_TEXT_BYTES {
+                        return Ok(None);
+                    }
+                    value.push_str(text.as_ref());
+                }
+            }
+            Event::End(element) => {
+                let local_name = element.local_name();
+                let is_corner = matches!(local_name.as_ref(), "lowerCorner" | "upperCorner");
+                if is_corner {
+                    if let Some((kind, value)) = active_corner.take() {
+                        let mut values = value.split_whitespace();
+                        let north = values.next().and_then(|item| item.parse::<f64>().ok());
+                        let east = values.next().and_then(|item| item.parse::<f64>().ok());
+                        match (kind, north, east) {
+                            ("lower", Some(north), Some(east)) => lower = Some((north, east)),
+                            ("upper", Some(north), Some(east)) => upper = Some((north, east)),
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    Ok(match (lower, upper) {
+        (Some((south, west)), Some((north, east)))
+            if south.is_finite()
+                && west.is_finite()
+                && north.is_finite()
+                && east.is_finite()
+                && south < north
+                && west < east =>
+        {
+            Some(GeographicEnvelope {
+                south,
+                west,
+                north,
+                east,
+            })
+        }
+        _ => None,
+    })
 }
 
 fn safe_texture_image(
@@ -745,11 +865,122 @@ fn safe_texture_image(
         return Err(format!("terrain texture escapes input root: {uri}").into());
     }
     let bytes = fs::read(candidate)?;
-    if bytes.len() > 64 * 1024 * 1024 {
+    if bytes.len() > MAX_TERRAIN_TEXTURE_BYTES {
         return Err("terrain texture exceeds 64 MiB limit".into());
     }
     let mime_type = image_mime_and_dimensions(&bytes)?;
     Ok(TerrainTexture { mime_type, bytes })
+}
+
+fn find_adjacent_map_texture(
+    input_root: &Path,
+    source_file: &Path,
+    envelope: GeographicEnvelope,
+) -> Result<TerrainMapTexture, String> {
+    let source_name = source_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("DEM source file name is not valid UTF-8")?;
+    let map_directory = source_file
+        .parent()
+        .ok_or("DEM source file has no parent directory")?
+        .join(format!("{source_name}_map"));
+    if !map_directory.is_dir() {
+        return Err(format!(
+            "adjacent map directory does not exist: {}",
+            map_directory.display()
+        ));
+    }
+    let root = fs::canonicalize(input_root).map_err(|error| error.to_string())?;
+    let map_root = fs::canonicalize(&map_directory).map_err(|error| error.to_string())?;
+    if !map_root.starts_with(&root) {
+        return Err("adjacent map directory escapes the input root".to_owned());
+    }
+    let candidates = fs::read_dir(&map_root)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("combined_map_mesh")
+                            && name.to_ascii_lowercase().ends_with(".png")
+                    })
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Err(format!(
+            "expected exactly one combined_map_mesh*.png in {}, found {}",
+            map_directory.display(),
+            candidates.len()
+        ));
+    }
+    let candidate = fs::canonicalize(&candidates[0]).map_err(|error| error.to_string())?;
+    if !candidate.starts_with(&map_root) {
+        return Err("map texture resolves outside its adjacent map directory".to_owned());
+    }
+    let relative = candidate
+        .strip_prefix(&root)
+        .map_err(|_| "map texture resolves outside the input root")?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if fs::metadata(&candidate)
+        .map_err(|error| error.to_string())?
+        .len()
+        > u64::try_from(MAX_TERRAIN_TEXTURE_BYTES).expect("texture byte limit fits in u64")
+    {
+        return Err("map texture exceeds 64 MiB limit".to_owned());
+    }
+    // Validate fallback imagery before it becomes part of a tile, so a corrupt
+    // or oversized map skips only its terrain rather than aborting conversion.
+    safe_texture_image(&root, &relative).map_err(|error| error.to_string())?;
+    Ok(TerrainMapTexture {
+        image_uri: relative,
+        envelope,
+    })
+}
+
+fn terrain_map_uvs(
+    ring: &RawTerrainRing,
+    envelope: GeographicEnvelope,
+) -> Result<Vec<(f64, f64)>, String> {
+    if ring.dimension < 2 || ring.values.len() < ring.dimension * 3 {
+        return Err("surface has fewer than three geographic positions".to_owned());
+    }
+    let latitude_span = envelope.north - envelope.south;
+    let longitude_span = envelope.east - envelope.west;
+    if !latitude_span.is_finite()
+        || !longitude_span.is_finite()
+        || latitude_span <= 0.0
+        || longitude_span <= 0.0
+    {
+        return Err("GML geographic boundedBy envelope is invalid".to_owned());
+    }
+    ring.values
+        .chunks_exact(ring.dimension)
+        .map(|coordinate| {
+            let (latitude, longitude) = match ring.axis_order {
+                AxisOrder::EastNorthUp => (coordinate[1], coordinate[0]),
+                AxisOrder::NorthEastUp | AxisOrder::Unknown => (coordinate[0], coordinate[1]),
+            };
+            if !latitude.is_finite() || !longitude.is_finite() {
+                return Err("surface has a non-finite geographic position".to_owned());
+            }
+            let u = (longitude - envelope.west) / longitude_span;
+            // GML envelopes use increasing latitude northward, while raster rows increase down.
+            let v = 1.0 - (latitude - envelope.south) / latitude_span;
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                return Err(
+                    "surface position lies outside the GML geographic boundedBy envelope"
+                        .to_owned(),
+                );
+            }
+            Ok((u, v))
+        })
+        .collect()
 }
 
 fn image_mime_and_dimensions(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
@@ -757,9 +988,10 @@ fn image_mime_and_dimensions(bytes: &[u8]) -> Result<String, Box<dyn std::error:
     if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" && &bytes[12..16] == b"IHDR" {
         let width = u32::from_be_bytes(bytes[16..20].try_into()?);
         let height = u32::from_be_bytes(bytes[20..24].try_into()?);
-        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        if !valid_texture_dimensions(width, height, MAX_DIMENSION) {
             return Err("invalid PNG texture dimensions".into());
         }
+        validate_png(bytes)?;
         return Ok("image/png".to_owned());
     }
     if bytes.len() >= 4 && bytes[0] == 0xff && bytes[1] == 0xd8 {
@@ -786,7 +1018,7 @@ fn image_mime_and_dimensions(bytes: &[u8]) -> Result<String, Box<dyn std::error:
             {
                 let height = u32::from(u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]));
                 let width = u32::from(u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]));
-                if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+                if !valid_texture_dimensions(width, height, MAX_DIMENSION) {
                     return Err("invalid JPEG texture dimensions".into());
                 }
                 return Ok("image/jpeg".to_owned());
@@ -795,6 +1027,32 @@ fn image_mime_and_dimensions(bytes: &[u8]) -> Result<String, Box<dyn std::error:
         }
     }
     Err("terrain texture must be a PNG or JPEG with valid dimensions".into())
+}
+
+fn validate_png(bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info()?;
+    let buffer_size = reader
+        .output_buffer_size()
+        .ok_or("PNG decoded buffer size is unavailable")?;
+    if u64::try_from(buffer_size)? > MAX_TERRAIN_TEXTURE_DECODED_RGBA_BYTES {
+        return Err("PNG texture exceeds decoded memory limit".into());
+    }
+    let mut decoded_pixels = vec![0_u8; buffer_size];
+    reader.next_frame(&mut decoded_pixels)?;
+    Ok(())
+}
+
+fn valid_texture_dimensions(width: u32, height: u32, max_dimension: u32) -> bool {
+    width != 0
+        && height != 0
+        && width <= max_dimension
+        && height <= max_dimension
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .is_some_and(|rgba_bytes| rgba_bytes <= MAX_TERRAIN_TEXTURE_DECODED_RGBA_BYTES)
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -902,24 +1160,114 @@ fn lod_from_u8(lod: u8) -> Option<Lod> {
     }
 }
 
-#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn write_terrain_tiles(
     output: &Path,
     generation_id: &str,
     terrain: Vec<RawTerrain>,
-    texture_declarations: Vec<ParsedTerrainTexture>,
+    texture_declarations: Vec<TerrainTextureDeclaration>,
     input_root: &Path,
+    source_files: &[(i64, PathBuf, String, u64)],
+    terrain_envelopes: &BTreeMap<i64, GeographicEnvelope>,
+    issues: &mut Vec<ConversionIssue>,
 ) -> Result<Vec<TerrainTileOutput>, Box<dyn std::error::Error>> {
     let textures_by_surface = texture_declarations
         .into_iter()
-        .map(|texture| (texture.target_id.clone(), texture))
+        .map(|declaration| {
+            (
+                (
+                    declaration.source_file_id,
+                    declaration.texture.target_id.clone(),
+                ),
+                declaration.texture,
+            )
+        })
         .collect::<BTreeMap<_, _>>();
+    let source_paths = source_files
+        .iter()
+        .map(|(id, path, _, _)| (*id, path.as_path()))
+        .collect::<BTreeMap<_, _>>();
+    let mut fallback_by_source = BTreeMap::<i64, Result<TerrainMapTexture, String>>::new();
+    let mut fallback_reported = BTreeSet::new();
     let mut grouped =
         BTreeMap::<TileId, Vec<(String, i64, RawTerrainRing, ParsedTerrainTexture)>>::new();
     for feature in terrain {
         for ring in feature.rings {
-            let Some(texture) = textures_by_surface.get(&ring.surface_id) else {
-                continue;
+            let texture = if let Some(texture) =
+                textures_by_surface.get(&(feature.source_file_id, ring.surface_id.clone()))
+            {
+                texture.clone()
+            } else {
+                let fallback = fallback_by_source
+                    .entry(feature.source_file_id)
+                    .or_insert_with(|| {
+                        let Some(source_path) = source_paths.get(&feature.source_file_id) else {
+                            return Err("terrain source file is unavailable".to_owned());
+                        };
+                        let Some(envelope) = terrain_envelopes.get(&feature.source_file_id) else {
+                            return Err(
+                                "GML geographic boundedBy envelope is unavailable".to_owned()
+                            );
+                        };
+                        find_adjacent_map_texture(input_root, source_path, *envelope)
+                    });
+                match fallback {
+                    Ok(map) => {
+                        if fallback_reported.insert((feature.source_file_id, true)) {
+                            issues.push(ConversionIssue {
+                                source_file_id: feature.source_file_id,
+                                building_id: None,
+                                diagnostic: Diagnostic {
+                                    kind: DiagnosticKind::UnsupportedElement,
+                                    message: format!(
+                                        "terrain map texture fallback used: {}",
+                                        map.image_uri
+                                    ),
+                                },
+                            });
+                        }
+                        match terrain_map_uvs(&ring, map.envelope) {
+                            Ok(coordinates) => ParsedTerrainTexture {
+                                target_id: ring.surface_id.clone(),
+                                image_uri: map.image_uri.clone(),
+                                coordinates,
+                            },
+                            Err(message) => {
+                                issues.push(ConversionIssue {
+                                    source_file_id: feature.source_file_id,
+                                    building_id: Some(feature.id.clone()),
+                                    diagnostic: Diagnostic {
+                                        kind: DiagnosticKind::InvalidTexture,
+                                        message: format!(
+                                            "terrain map texture fallback excluded surface {}: {message}",
+                                            ring.surface_id
+                                        ),
+                                    },
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        if fallback_reported.insert((feature.source_file_id, false)) {
+                            issues.push(ConversionIssue {
+                                source_file_id: feature.source_file_id,
+                                building_id: None,
+                                diagnostic: Diagnostic {
+                                    kind: DiagnosticKind::InvalidTexture,
+                                    message: format!(
+                                        "terrain map texture fallback unavailable; terrain surfaces without explicit ParameterizedTexture were excluded: {message}"
+                                    ),
+                                },
+                            });
+                        }
+                        continue;
+                    }
+                }
             };
             let Some(first) = ring.values.chunks(ring.dimension).next() else {
                 continue;
@@ -935,12 +1283,7 @@ fn write_terrain_tiles(
             grouped
                 .entry(tile_for_point(point.x, point.y, DEFAULT_TILE_SIZE_METERS))
                 .or_default()
-                .push((
-                    feature.id.clone(),
-                    feature.source_file_id,
-                    ring,
-                    texture.clone(),
-                ));
+                .push((feature.id.clone(), feature.source_file_id, ring, texture));
         }
     }
     let tile_count = grouped.len();
@@ -1739,6 +2082,18 @@ mod tests {
         Option<String>,
         Option<String>,
     );
+
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0; 16]).unwrap();
+        }
+        bytes
+    }
     #[test]
     fn parses_inspect_and_tolerant_convert() {
         assert_eq!(
@@ -1897,11 +2252,18 @@ mod tests {
         .unwrap();
         let terrain_gml = input.join("udx/dem/terrain.gml");
         fs::write(&terrain_gml, r##"<core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0" xmlns:dem="http://www.opengis.net/citygml/relief/2.0" xmlns:app="http://www.opengis.net/citygml/appearance/2.0" xmlns:gml="http://www.opengis.net/gml"><dem:ReliefFeature gml:id="terrain-1"><dem:reliefComponent><dem:TINRelief><gml:Triangle gml:id="surface-1"><gml:LinearRing gml:id="ring-1" srsName="urn:ogc:def:crs:EPSG::6697"><gml:posList>35 139 0 35 139.1 0 35.1 139 0 35 139 0</gml:posList></gml:LinearRing></gml:Triangle></dem:TINRelief></dem:reliefComponent></dem:ReliefFeature><app:ParameterizedTexture><app:imageURI>terrain.png</app:imageURI><app:target uri="#ring-1"><app:TexCoordList><app:textureCoordinates>0 0 1 0 0 1 0 0</app:textureCoordinates></app:TexCoordList></app:target></app:ParameterizedTexture></core:CityModel>"##).unwrap();
-        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
-        png.extend(2_u32.to_be_bytes());
-        png.extend(2_u32.to_be_bytes());
-        png.extend([8, 2, 0, 0, 0]);
-        fs::write(input.join("terrain.png"), png).unwrap();
+        fs::write(input.join("terrain.png"), tiny_png()).unwrap();
+        fs::create_dir_all(input.join("udx/dem/terrain.gml_map")).unwrap();
+        fs::write(
+            input.join("udx/dem/terrain.gml_map/combined_map_mesh0.png"),
+            tiny_png(),
+        )
+        .unwrap();
+        fs::write(
+            input.join("udx/dem/terrain.gml_map/combined_map_mesh1.png"),
+            tiny_png(),
+        )
+        .unwrap();
         let output = root.join("output");
         convert(&input, &output, Mode::Strict, 1).unwrap();
         let manifest: serde_json::Value =
@@ -1945,6 +2307,156 @@ mod tests {
             .map(Result::unwrap)
             .collect::<Vec<_>>();
         assert_eq!(content_types, vec!["building", "terrain"]);
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM conversion_issues", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terrain_map_uvs_cover_geographic_corners_with_inverted_v_axis() {
+        let ring = RawTerrainRing {
+            surface_id: "surface".to_owned(),
+            values: vec![35.0, 139.0, 0.0, 36.0, 140.0, 0.0, 35.0, 140.0, 0.0],
+            dimension: 3,
+            axis_order: AxisOrder::NorthEastUp,
+        };
+        assert_eq!(
+            terrain_map_uvs(
+                &ring,
+                GeographicEnvelope {
+                    south: 35.0,
+                    west: 139.0,
+                    north: 36.0,
+                    east: 140.0,
+                },
+            )
+            .unwrap(),
+            vec![(0.0, 1.0), (1.0, 0.0), (1.0, 1.0)]
+        );
+    }
+
+    #[test]
+    fn map_texture_fallback_embeds_adjacent_png_and_synthesizes_surface_id() {
+        let root = std::env::temp_dir().join(format!(
+            "citymodel-terrain-map-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let input = root.join("dataset");
+        let dem = input.join("udx/dem");
+        fs::create_dir_all(dem.join("terrain.gml_map")).unwrap();
+        let terrain_gml = dem.join("terrain.gml");
+        fs::write(&terrain_gml, r#"<core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0" xmlns:dem="http://www.opengis.net/citygml/relief/2.0" xmlns:gml="http://www.opengis.net/gml"><gml:boundedBy><gml:Envelope srsName="urn:ogc:def:crs:EPSG::6697"><gml:lowerCorner>35 139</gml:lowerCorner><gml:upperCorner>36 140</gml:upperCorner></gml:Envelope></gml:boundedBy><dem:ReliefFeature gml:id="terrain-1"><dem:reliefComponent><dem:TINRelief><gml:Triangle><gml:LinearRing srsName="urn:ogc:def:crs:EPSG::6697"><gml:posList>35 139 0 36 140 0 35 140 0</gml:posList></gml:LinearRing></gml:Triangle></dem:TINRelief></dem:reliefComponent></dem:ReliefFeature></core:CityModel>"#).unwrap();
+        fs::write(
+            dem.join("terrain.gml_map/combined_map_mesh0_v0_p0.png"),
+            tiny_png(),
+        )
+        .unwrap();
+        let report = parse_file(
+            hash_input_file(&terrain_gml).unwrap(),
+            InputLimits::default(),
+        );
+        let (terrain, _) = extract_terrain(&report.events, 1);
+        assert_eq!(
+            terrain[0].rings[0].surface_id,
+            "terrain-1:terrain-surface-1"
+        );
+        let output = root.join("output");
+        convert(&input, &output, Mode::Strict, 1).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("dataset.manifest.json")).unwrap())
+                .unwrap();
+        let terrain = manifest["tiles"]["items"][0]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|content| content["featureType"] == "terrain")
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join(terrain["metadata"].as_str().unwrap())).unwrap(),
+        )
+        .unwrap();
+        let glb = fs::read(output.join(metadata["content"]["glb"].as_str().unwrap())).unwrap();
+        assert!(glb.windows(10).any(|value| value == b"TEXCOORD_0"));
+        assert!(glb.windows(9).any(|value| value == b"image/png"));
+        let database = rusqlite::Connection::open(output.join("citymodel.sqlite")).unwrap();
+        let diagnostic: String = database
+            .query_row("SELECT message FROM conversion_issues", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(diagnostic.starts_with("terrain map texture fallback used:"));
+        drop(database);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("conversion.report.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            report["terrainTextureFallbacks"].as_array().unwrap().len(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_or_corrupt_adjacent_map_skips_only_untextured_terrain() {
+        let root = std::env::temp_dir().join(format!(
+            "citymodel-terrain-map-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let input = root.join("dataset");
+        fs::create_dir_all(input.join("udx/dem")).unwrap();
+        fs::create_dir_all(input.join("udx/bldg")).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../citymodel-citygml/tests/fixtures/plateau-lod1-small.gml"),
+            input.join("udx/bldg/building.gml"),
+        )
+        .unwrap();
+        let terrain_gml = input.join("udx/dem/terrain.gml");
+        fs::write(&terrain_gml, r#"<core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0" xmlns:dem="http://www.opengis.net/citygml/relief/2.0" xmlns:gml="http://www.opengis.net/gml"><gml:boundedBy><gml:Envelope><gml:lowerCorner>35 139</gml:lowerCorner><gml:upperCorner>36 140</gml:upperCorner></gml:Envelope></gml:boundedBy><dem:ReliefFeature gml:id="terrain-1"><gml:Triangle><gml:LinearRing><gml:posList>35 139 0 36 140 0 35 140 0</gml:posList></gml:LinearRing></gml:Triangle></dem:ReliefFeature></core:CityModel>"#).unwrap();
+        let envelope = GeographicEnvelope {
+            south: 35.0,
+            west: 139.0,
+            north: 36.0,
+            east: 140.0,
+        };
+        assert!(find_adjacent_map_texture(&input, &terrain_gml, envelope).is_err());
+        let map = input.join("udx/dem/terrain.gml_map");
+        fs::create_dir_all(&map).unwrap();
+        fs::write(map.join("combined_map_mesh0.png"), b"not a PNG").unwrap();
+        let output = root.join("output");
+        convert(&input, &output, Mode::Strict, 1).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("conversion.report.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["terrainTiles"], 0);
+        assert!(report["summary"]["diagnostics"].as_u64().unwrap() >= 1);
+        assert!(
+            report["terrainTextureFallbacks"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("fallback unavailable")
+        );
+        assert!(
+            report["terrainTextureFallbacks"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("terrain texture must be a PNG or JPEG")
+        );
+        let database = rusqlite::Connection::open(output.join("citymodel.sqlite")).unwrap();
+        let diagnostic: String = database
+            .query_row("SELECT message FROM conversion_issues", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(diagnostic.contains("fallback unavailable"));
         drop(database);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1955,6 +2467,16 @@ mod tests {
         assert!(safe_texture_image(&root, "../escape.png").is_err());
         assert!(safe_texture_image(&root, "https://example.test/terrain.png").is_err());
         assert!(image_mime_and_dimensions(b"not an image").is_err());
+        let mut header_only = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        header_only.extend(2_u32.to_be_bytes());
+        header_only.extend(2_u32.to_be_bytes());
+        header_only.extend([8, 2, 0, 0, 0]);
+        assert!(image_mime_and_dimensions(&header_only).is_err());
+        let mut decompression_bomb = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        decompression_bomb.extend(16_384_u32.to_be_bytes());
+        decompression_bomb.extend(16_384_u32.to_be_bytes());
+        decompression_bomb.extend([8, 2, 0, 0, 0]);
+        assert!(image_mime_and_dimensions(&decompression_bomb).is_err());
     }
 
     #[test]
