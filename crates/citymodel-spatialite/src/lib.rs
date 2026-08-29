@@ -5,6 +5,8 @@ use std::path::Path;
 
 pub const MODULE_NAME: &str = "citymodel-spatialite";
 const INITIAL_SCHEMA: &str = include_str!("../../../contracts/sql/001_initial.sql");
+const COMMON_FEATURES_SCHEMA: &str =
+    include_str!("../../../contracts/sql/002_add_common_features.sql");
 #[must_use]
 pub fn contract_schema_version() -> &'static str {
     citymodel_core::CURRENT_CONTRACT_VERSION.schema_version
@@ -28,6 +30,7 @@ pub struct BuildingRow<'a> {
 pub fn create_database(path: &Path) -> rusqlite::Result<Connection> {
     let connection = Connection::open(path)?;
     connection.execute_batch(INITIAL_SCHEMA)?;
+    connection.execute_batch(COMMON_FEATURES_SCHEMA)?;
     connection.pragma_update(None, "journal_mode", "DELETE")?;
     Ok(connection)
 }
@@ -63,6 +66,7 @@ mod tests {
     fn creates_indexed_database_and_rejects_duplicates() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(INITIAL_SCHEMA).unwrap();
+        connection.execute_batch(COMMON_FEATURES_SCHEMA).unwrap();
         connection
             .pragma_update(None, "foreign_keys", "OFF")
             .unwrap();

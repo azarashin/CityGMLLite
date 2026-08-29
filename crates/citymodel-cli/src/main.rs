@@ -68,6 +68,8 @@ struct TileOutput {
     building_ids: Vec<String>,
     glb_path: String,
     metadata_path: String,
+    metadata_sha256: String,
+    metadata_byte_length: usize,
     glb_sha256: String,
     glb_byte_length: usize,
     bounds: [f64; 4],
@@ -572,6 +574,7 @@ fn write_tiles(
             glb_sha256: &asset.sha256,
             glb_byte_length: asset.bytes.len() as u64,
             building_ids: &building_ids,
+            feature_type: "building",
             tile_bounds: bounds,
             content_bounds,
             projected_origin: [origin.x, origin.y, origin.z],
@@ -580,12 +583,17 @@ fn write_tiles(
             vertex_count: triangle_count * 3,
             triangle_count,
         });
-        metadata::write_json_under(output, &metadata_path, &metadata_json)?;
+        let metadata_output = metadata::write_json_under(output, &metadata_path, &metadata_json)?;
+        let metadata_byte_length = usize::try_from(fs::metadata(&metadata_output)?.len())
+            .map_err(|_| std::io::Error::other("tile metadata exceeds supported size"))?;
+        let metadata_sha256 = sha256_file(&metadata_output)?;
         outputs.push(TileOutput {
             id,
             building_ids,
             glb_path,
             metadata_path,
+            metadata_sha256,
+            metadata_byte_length,
             glb_sha256: asset.sha256,
             glb_byte_length: asset.bytes.len(),
             bounds,
@@ -617,6 +625,7 @@ fn write_database(
     }
     for tile in tiles {
         connection.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.0, 0.0, 0.0, 4326, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, '[]', ?21, 0, ?22, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.building_ids.len() as i64, tile.triangle_count as i64])?;
+        connection.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'building', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
     }
     for assignment in assignments {
         let canonical = format!("{dataset_id}::{}", assignment.building_id);
@@ -634,7 +643,10 @@ fn write_database(
         let attributes_json = attributes_json(&assignment.attributes);
         connection.execute("UPDATE buildings SET tile_id=?1, local_feature_id=?2, lod_used=?3, centroid_x=?4, centroid_y=?5, attributes_json=?6 WHERE building_id=?7", params![assignment.tile_id, i64::from(assignment.feature_id), i64::from(assignment.lod_used), assignment.centroid.x, assignment.centroid.y, attributes_json, assignment.building_id])?;
         connection.execute("INSERT INTO tile_features (tile_id, local_feature_id, building_id, building_part_id) VALUES (?1, ?2, ?3, NULL)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
+        connection.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'building', ?1, 'gml', 0, ?3)", params![assignment.building_id, canonical, assignment.source_file_id])?;
+        connection.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'building', ?2, ?3)", params![assignment.tile_id, i64::from(assignment.feature_id), assignment.building_id])?;
         insert_attributes(&connection, &assignment.building_id, &assignment.attributes)?;
+        insert_feature_attributes(&connection, &assignment.building_id, &assignment.attributes)?;
     }
     for issue in issues {
         connection.execute(
@@ -665,6 +677,31 @@ fn insert_attributes(
         connection.execute(
             "INSERT INTO building_attributes (building_id, namespace_uri, attribute_path, attribute_key, ordinal, value_type, value_text, value_real, value_integer, value_boolean, value_datetime, uom, code_space, nil_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11)",
             params![building_id, attribute.namespace_uri, attribute.attribute_path, attribute.attribute_key, *ordinal, value_type, value_text, value_real, attribute.uom, attribute.code_space, attribute.nil_reason],
+        )?;
+        *ordinal += 1;
+    }
+    Ok(())
+}
+
+fn insert_feature_attributes(
+    connection: &rusqlite::Connection,
+    feature_id: &str,
+    attributes: &[BuildingAttribute],
+) -> rusqlite::Result<()> {
+    let mut ordinals = BTreeMap::<(String, String), i64>::new();
+    for attribute in attributes {
+        let key = (
+            attribute.namespace_uri.clone(),
+            attribute.attribute_path.clone(),
+        );
+        let ordinal = ordinals.entry(key).or_insert(0);
+        let (value_type, value_text, value_real) = match &attribute.value {
+            AttributeValue::Code(value) => ("code", Some(value.as_str()), None),
+            AttributeValue::Real(value) => ("real", None, Some(*value)),
+        };
+        connection.execute(
+            "INSERT INTO feature_attributes (feature_id, namespace_uri, attribute_path, attribute_key, ordinal, value_type, value_text, value_real, value_integer, value_boolean, value_datetime, uom, code_space, nil_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10, ?11)",
+            params![feature_id, attribute.namespace_uri, attribute.attribute_path, attribute.attribute_key, *ordinal, value_type, value_text, value_real, attribute.uom, attribute.code_space, attribute.nil_reason],
         )?;
         *ordinal += 1;
     }
@@ -709,7 +746,7 @@ fn write_manifest(
     let input_files = source_files.iter().map(|(_, path, sha256, _)| json!({"path":path.file_name().and_then(|name| name.to_str()).unwrap_or("input.gml"),"sha256":sha256})).collect::<Vec<_>>();
     let items = tiles
         .iter()
-        .map(|tile| json!({"tileId":tile.id,"metadata":tile.metadata_path}))
+        .map(|tile| json!({"tileId":tile.id,"metadata":tile.metadata_path,"contents":[{"featureType":"building","metadata":tile.metadata_path,"sha256":tile.metadata_sha256,"byteLength":tile.metadata_byte_length}]}))
         .collect::<Vec<_>>();
     let manifest = json!({"schemaVersion":"1.0.0","datasetId":dataset_id,"generationId":generation_id,"generatedAt":"1970-01-01T00:00:00Z","generator":{"name":"citymodel","version":"0.1.0-dev"},"source":{"format":"CityGML","profile":"PLATEAU","citygmlVersion":"2.0","files":source_files.len(),"inputFiles":input_files,"conversionConfiguration":{"lod":max_lod,"maxLod":max_lod,"lodSelection":"highest-available-at-or-below-max-lod","tileSizeMetres":DEFAULT_TILE_SIZE_METERS,"workingCrs":"EPSG:3857"}},"coordinateReference":{"sourceCrs":{"epsg":6697,"wkt":null,"axisOrder":["latitude","longitude","height"]},"workingCrs":{"epsg":WORKING_EPSG,"wkt":null,"axisOrder":["easting","northing","height"],"unit":"metre"},"verticalReference":{"type":"source-defined","epsg":null,"geoidModel":null}},"datasetOrigin":{"geographic":{"latitude":geographic.0,"longitude":geographic.1,"height":origin.z,"epsg":4326},"projected":{"x":origin.x,"y":origin.y,"z":origin.z,"epsg":WORKING_EPSG}},"tiling":{"scheme":"projected-grid","defaultTileSizeMetres":DEFAULT_TILE_SIZE_METERS,"buildingAssignment":"representative-point","geometryClipping":false},"modelProfile":{"lod":max_lod,"textures":false,"compression":null,"featureIdSemantic":"_FEATURE_ID_0","featureIdComponentType":"UNSIGNED_SHORT"},"database":{"path":"citymodel.sqlite","sha256":database_sha256},"tiles":{"indexType":"inline","items":items}});
     fs::write(
@@ -852,6 +889,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn converts_lod1_fixture_to_a_unity_dataset() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../citymodel-citygml/tests/fixtures/plateau-lod1-small.gml");
@@ -864,8 +902,25 @@ mod tests {
             serde_json::from_slice(&fs::read(output.join("dataset.manifest.json")).unwrap())
                 .unwrap();
         let metadata = manifest["tiles"]["items"][0]["metadata"].as_str().unwrap();
+        let content_index = &manifest["tiles"]["items"][0]["contents"][0];
+        assert_eq!(content_index["featureType"], "building");
+        assert_eq!(content_index["metadata"], metadata);
+        assert_eq!(
+            usize::try_from(content_index["byteLength"].as_u64().unwrap()).unwrap(),
+            usize::try_from(fs::metadata(output.join(metadata)).unwrap().len()).unwrap()
+        );
+        assert_eq!(
+            content_index["sha256"],
+            sha256_file(&output.join(metadata)).unwrap()
+        );
         let tile: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join(metadata)).unwrap()).unwrap();
+        assert_eq!(tile["content"]["featureType"], "building");
+        assert_eq!(tile["features"]["items"][0]["featureType"], "building");
+        assert_eq!(
+            tile["features"]["items"][0]["featureId"],
+            "sample-building-1"
+        );
         let glb = fs::read(output.join(tile["content"]["glb"].as_str().unwrap())).unwrap();
         assert_eq!(&glb[..4], b"glTF");
         assert!(output.join("citymodel.sqlite").is_file());
@@ -909,6 +964,45 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&attributes_json).unwrap()[0]["namespaceUri"],
             "http://www.opengis.net/citygml/building/2.0"
         );
+        let common_feature: (String, String) = database.query_row(
+            "SELECT feature_id, feature_type FROM features WHERE feature_id = 'sample-building-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            common_feature,
+            ("sample-building-1".to_owned(), "building".to_owned())
+        );
+        let common_attribute_count: i64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM feature_attributes WHERE feature_id = 'sample-building-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(common_attribute_count, 2);
+        let common_mapping: String = database
+            .query_row(
+                "SELECT feature_id FROM feature_tile_mappings WHERE feature_type = 'building' AND local_feature_id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(common_mapping, "sample-building-1");
+        let common_content: (String, String, String) = database
+            .query_row(
+                "SELECT feature_type, metadata_relative_path, glb_relative_path FROM tile_contents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(common_content.0, "building");
+        assert_eq!(common_content.1, metadata);
+        assert_eq!(common_content.2, tile["content"]["glb"].as_str().unwrap());
+        let user_version: i64 = database
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(user_version, 2);
         drop(database);
         fs::remove_dir_all(output).unwrap();
     }

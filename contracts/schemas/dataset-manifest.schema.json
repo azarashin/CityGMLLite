@@ -131,7 +131,12 @@
             "required": ["tileId", "metadata"],
             "properties": {
               "tileId": { "$ref": "#/$defs/nonEmptyString" },
-              "metadata": { "$ref": "#/$defs/relativePath" }
+              "metadata": { "$ref": "#/$defs/relativePath" },
+              "contents": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/tileContentIndex" },
+                "uniqueItems": true
+              }
             }
           }
         },
@@ -156,6 +161,17 @@
       "type": "string",
       "minLength": 1,
       "pattern": "^(?![A-Za-z]:)(?![\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$"
+    },
+    "tileContentIndex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["featureType", "metadata", "sha256", "byteLength"],
+      "properties": {
+        "featureType": { "$ref": "#/$defs/nonEmptyString" },
+        "metadata": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byteLength": { "type": "integer", "minimum": 0 }
+      }
     },
     "axisOrder": {
       "type": "array",

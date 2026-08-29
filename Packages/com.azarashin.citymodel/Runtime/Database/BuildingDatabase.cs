@@ -51,6 +51,9 @@ namespace CityModel.Database
             try
             {
                 store = SqliteReadOnlyBuildingStore.Open(databasePath);
+                var databaseUserVersion = store.ReadUserVersion();
+                if (databaseUserVersion < 1 || databaseUserVersion > CityModelContractVersion.DatabaseUserVersion)
+                    throw new InvalidDataException("SQLite user_version is not supported by this runtime.");
                 var metadata = store.ReadMetadata();
                 if (metadata.SchemaVersion != CityModelContractVersion.SchemaVersion || metadata.GenerationId != manifest.generationId)
                     throw new InvalidDataException("SQLite metadata does not match the dataset manifest.");
