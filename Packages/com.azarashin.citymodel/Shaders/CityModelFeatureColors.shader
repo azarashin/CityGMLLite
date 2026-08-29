@@ -7,12 +7,10 @@ Shader "CityModel/Feature Colors"
     }
     SubShader
     {
-        Tags { "RenderType" = "Opaque" "Queue" = "Geometry" }
+        Tags { "RenderType" = "Opaque" "Queue" = "Geometry" "RenderPipeline" = "UniversalPipeline" }
         Pass
         {
-            // The Quick Start project uses the Built-in Render Pipeline.  SRPDefaultUnlit
-            // is not selected there, so use the Built-in forward pass explicitly.
-            Tags { "LightMode" = "ForwardBase" }
+            Tags { "LightMode" = "UniversalForward" }
             Cull Back
             ZWrite On
             ZTest LEqual
@@ -21,10 +19,10 @@ Shader "CityModel/Feature Colors"
             #pragma target 4.5
             #pragma vertex Vert
             #pragma fragment Frag
-            #pragma multi_compile_fwdbase
-            #include "UnityCG.cginc"
-            #include "Lighting.cginc"
-            #include "AutoLight.cginc"
+            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
+            #pragma multi_compile _ _SHADOWS_SOFT
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
 
             StructuredBuffer<float4> _CityModelFeatureColors;
             int _CityModelFeatureColorCount;
@@ -41,17 +39,19 @@ Shader "CityModel/Feature Colors"
             {
                 float4 positionCS : SV_POSITION;
                 nointerpolation uint featureId : TEXCOORD0;
-                float3 worldNormal : TEXCOORD1;
-                SHADOW_COORDS(2)
+                float3 positionWS : TEXCOORD1;
+                float3 normalWS : TEXCOORD2;
             };
 
             Varyings Vert(Attributes input)
             {
                 Varyings output;
-                output.positionCS = UnityObjectToClipPos(input.positionOS);
+                VertexPositionInputs positionInputs = GetVertexPositionInputs(input.positionOS.xyz);
+                VertexNormalInputs normalInputs = GetVertexNormalInputs(input.normalOS);
+                output.positionCS = positionInputs.positionCS;
                 output.featureId = (uint)round(input.featureId.x);
-                output.worldNormal = UnityObjectToWorldNormal(input.normalOS);
-                TRANSFER_SHADOW(output)
+                output.positionWS = positionInputs.positionWS;
+                output.normalWS = normalInputs.normalWS;
                 return output;
             }
 
@@ -63,11 +63,11 @@ Shader "CityModel/Feature Colors"
                     color = _CityModelFeatureColors[input.featureId];
                 }
 
-                float3 worldNormal = normalize(input.worldNormal);
-                float3 ambient = ShadeSH9(float4(worldNormal, 1.0));
-                float lambert = saturate(dot(worldNormal, _WorldSpaceLightPos0.xyz));
-                float shadowAttenuation = SHADOW_ATTENUATION(input);
-                color.rgb *= ambient + (_LightColor0.rgb * (lambert * shadowAttenuation));
+                float3 worldNormal = normalize(input.normalWS);
+                Light mainLight = GetMainLight(TransformWorldToShadowCoord(input.positionWS));
+                float3 ambient = SampleSH(worldNormal);
+                float lambert = saturate(dot(worldNormal, mainLight.direction));
+                color.rgb *= ambient + (mainLight.color * (lambert * mainLight.shadowAttenuation));
 
                 // Keep the feature layer opaque even if a missing binding or source
                 // attribute supplied an unexpected alpha channel.

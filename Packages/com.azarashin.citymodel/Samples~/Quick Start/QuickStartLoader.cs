@@ -70,8 +70,8 @@ namespace CityModel.Samples
 
         private static Material CreateMaterial()
         {
-            var shader = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard");
-            if (shader == null) throw new InvalidOperationException("Neither Universal Render Pipeline/Lit nor Standard shader is available.");
+            var shader = Shader.Find("Universal Render Pipeline/Lit");
+            if (shader == null) throw new InvalidOperationException("Universal Render Pipeline/Lit shader is not available. Configure the project to use URP.");
             var material = new Material(shader) { color = new Color(0.68f, 0.78f, 0.92f) };
             return material;
         }
