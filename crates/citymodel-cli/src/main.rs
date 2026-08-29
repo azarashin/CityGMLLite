@@ -907,7 +907,7 @@ fn find_adjacent_map_texture(
     if !map_root.starts_with(&root) {
         return Err("adjacent map directory escapes the input root".to_owned());
     }
-    let candidates = fs::read_dir(&map_root)
+    let mut candidates = fs::read_dir(&map_root)
         .map_err(|error| error.to_string())?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -922,23 +922,44 @@ fn find_adjacent_map_texture(
                     })
         })
         .collect::<Vec<_>>();
-    if candidates.len() != 1 {
+    candidates.sort();
+    if candidates.is_empty() {
         return Err(format!(
-            "expected exactly one combined_map_mesh*.png in {}, found {}",
+            "expected at least one combined_map_mesh*.png in {}, found 0",
+            map_directory.display(),
+        ));
+    }
+
+    let mut candidate_hashes = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        let candidate = fs::canonicalize(candidate).map_err(|error| error.to_string())?;
+        if !candidate.starts_with(&map_root) {
+            return Err("map texture resolves outside its adjacent map directory".to_owned());
+        }
+        let bytes = fs::read(&candidate).map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_TERRAIN_TEXTURE_BYTES {
+            return Err("map texture exceeds 64 MiB limit".to_owned());
+        }
+        candidate_hashes.push((candidate, Sha256::digest(&bytes)));
+    }
+    let candidate = &candidate_hashes[0].0;
+    if candidate_hashes
+        .iter()
+        .skip(1)
+        .any(|(_, hash)| hash != &candidate_hashes[0].1)
+    {
+        return Err(format!(
+            "ambiguous combined_map_mesh*.png in {}: found {} distinct images",
             map_directory.display(),
             candidates.len()
         ));
-    }
-    let candidate = fs::canonicalize(&candidates[0]).map_err(|error| error.to_string())?;
-    if !candidate.starts_with(&map_root) {
-        return Err("map texture resolves outside its adjacent map directory".to_owned());
     }
     let relative = candidate
         .strip_prefix(&root)
         .map_err(|_| "map texture resolves outside the input root")?
         .to_string_lossy()
         .replace('\\', "/");
-    if fs::metadata(&candidate)
+    if fs::metadata(candidate)
         .map_err(|error| error.to_string())?
         .len()
         > u64::try_from(MAX_TERRAIN_TEXTURE_BYTES).expect("texture byte limit fits in u64")
@@ -2509,6 +2530,74 @@ mod tests {
             report["terrainTextureFallbacks"].as_array().unwrap().len(),
             1
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identical_adjacent_map_candidates_use_lexicographically_first() {
+        let root = std::env::temp_dir().join(format!(
+            "citymodel-identical-map-candidates-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dem = root.join("dataset/udx/dem");
+        let source = dem.join("terrain.gml");
+        let map = dem.join("terrain.gml_map");
+        fs::create_dir_all(&map).unwrap();
+        fs::write(&source, "<CityModel />").unwrap();
+        fs::write(map.join("combined_map_mesh0_v1_p0.png"), tiny_png()).unwrap();
+        fs::write(map.join("combined_map_mesh0_v0_p0.png"), tiny_png()).unwrap();
+
+        let texture = find_adjacent_map_texture(
+            &root.join("dataset"),
+            &source,
+            GeographicEnvelope {
+                south: 35.0,
+                west: 139.0,
+                north: 36.0,
+                east: 140.0,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            texture
+                .image_uri
+                .ends_with("terrain.gml_map/combined_map_mesh0_v0_p0.png")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn differing_adjacent_map_candidates_remain_ambiguous() {
+        let root = std::env::temp_dir().join(format!(
+            "citymodel-differing-map-candidates-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dem = root.join("dataset/udx/dem");
+        let source = dem.join("terrain.gml");
+        let map = dem.join("terrain.gml_map");
+        fs::create_dir_all(&map).unwrap();
+        fs::write(&source, "<CityModel />").unwrap();
+        fs::write(map.join("combined_map_mesh0_v0_p0.png"), tiny_png()).unwrap();
+        let mut different_png = tiny_png();
+        different_png.push(0);
+        fs::write(map.join("combined_map_mesh0_v1_p0.png"), different_png).unwrap();
+
+        let error = find_adjacent_map_texture(
+            &root.join("dataset"),
+            &source,
+            GeographicEnvelope {
+                south: 35.0,
+                west: 139.0,
+                north: 36.0,
+                east: 140.0,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("ambiguous combined_map_mesh*.png"));
         fs::remove_dir_all(root).unwrap();
     }
 
