@@ -23,4 +23,17 @@ cargo run -p citymodel-cli -- convert .\rawdata\city.gml --output .\output\city 
 `citymodel inspect` reports the input's `lod0Rings`, `lod1Rings`, and `lod2Rings`
 so the requested maximum can be chosen before conversion.
 
+## Conversion performance report
+
+Every successful conversion writes `conversion.report.json`. Its `summary` object is
+intended for first-pass performance analysis: it contains total elapsed time,
+stage timings and their percentage of the total, input and output byte counts,
+feature/tile/triangle counts, diagnostic count, and the five slowest and five
+largest input files. The existing `inputFiles` and `stages` objects retain the
+full per-file and per-stage details.
+
+The converter also prints the three longest conversion stages at completion. Use
+the report's `slowestInputFiles` list to distinguish one unusually expensive GML
+from a generally expensive parsing workload.
+
 The executable is built for Windows x64 with `cargo build --release -p citymodel-cli`.

@@ -532,11 +532,39 @@ fn convert(
         .iter()
         .map(|tile| tile.triangle_count)
         .sum::<usize>();
+    let stage_elapsed_ms = [
+        ("inputDiscoveryAndHashing", discovery_elapsed_ms),
+        ("parsingAndExtraction", parsing_elapsed_ms),
+        ("buildingGeometryPreparation", preparation_elapsed_ms),
+        ("buildingGlbTiles", building_glb_elapsed_ms),
+        ("terrainGlbTiles", terrain_glb_elapsed_ms),
+        ("sqliteWrite", sqlite_write_elapsed_ms),
+        ("databaseHash", database_hash_elapsed_ms),
+        ("manifestWrite", manifest_write_elapsed_ms),
+    ];
     let report_started = Instant::now();
     let report_path = output.join("conversion.report.json");
+    let total_elapsed_ms = elapsed_ms(total_started);
+    let summary = conversion_summary(
+        total_elapsed_ms,
+        &stage_elapsed_ms,
+        &input_file_breakdown,
+        raw_building_count,
+        raw_terrain_count,
+        assignments.len(),
+        tile_outputs.len(),
+        terrain_outputs.len(),
+        building_triangle_count,
+        terrain_triangle_count,
+        building_glb_byte_length,
+        terrain_glb_byte_length,
+        database_byte_length,
+        issues.len(),
+    );
     fs::write(
         &report_path,
         serde_json::to_vec_pretty(&json!({
+            "summary": summary,
             "datasetId":dataset_id,
             "generationId":generation_id,
             "sourceFiles":source_files.len(),
@@ -545,7 +573,7 @@ fn convert(
             "tiles":tile_outputs.len(),
             "mode":format!("{mode:?}"),
             "maxLod":max_lod,
-            "totalElapsedMs": elapsed_ms(total_started),
+            "totalElapsedMs": total_elapsed_ms,
             "inputFiles": input_file_breakdown.iter().map(|file| json!({
                 "relativePath": file.relative_path,
                 "byteLength": file.byte_length,
@@ -568,9 +596,20 @@ fn convert(
             }
         }))?,
     )?;
+    let bottleneck_stages = top_stage_summary(&stage_elapsed_ms, 3)
+        .iter()
+        .map(|stage| {
+            format!(
+                "{}={} ms ({}%)",
+                stage.0,
+                stage.1,
+                percentage_of_total(stage.1, total_elapsed_ms)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     eprintln!(
-        "[citymodel] conversion finished: {} ms; report: {}",
-        elapsed_ms(total_started),
+        "[citymodel] conversion finished: {total_elapsed_ms} ms; bottlenecks: {bottleneck_stages}; report: {}",
         report_path.display()
     );
     Ok(())
@@ -1473,6 +1512,118 @@ fn elapsed_ms(started: Instant) -> u128 {
     started.elapsed().as_millis()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn conversion_summary(
+    total_elapsed_ms: u128,
+    stage_elapsed_ms: &[(&str, u128)],
+    input_files: &[InputFileBreakdown],
+    raw_building_count: usize,
+    raw_terrain_count: usize,
+    prepared_building_count: usize,
+    building_tile_count: usize,
+    terrain_tile_count: usize,
+    building_triangle_count: usize,
+    terrain_triangle_count: usize,
+    building_glb_byte_length: usize,
+    terrain_glb_byte_length: usize,
+    database_byte_length: u64,
+    diagnostics: usize,
+) -> serde_json::Value {
+    let total_input_bytes = input_files.iter().map(|file| file.byte_length).sum::<u64>();
+    let stage_timings = top_stage_summary(stage_elapsed_ms, stage_elapsed_ms.len())
+        .into_iter()
+        .map(|(name, elapsed_ms)| {
+            json!({
+                "name": name,
+                "elapsedMs": elapsed_ms,
+                "percentOfTotal": percentage_of_total(elapsed_ms, total_elapsed_ms),
+            })
+        })
+        .collect::<Vec<_>>();
+    let slowest_input_files = input_file_summary(input_files, |left, right| {
+        right
+            .parsing_elapsed_ms
+            .cmp(&left.parsing_elapsed_ms)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    let largest_input_files = input_file_summary(input_files, |left, right| {
+        right
+            .byte_length
+            .cmp(&left.byte_length)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    json!({
+        "totalElapsedMs": total_elapsed_ms,
+        "stageTimings": stage_timings,
+        "input": {
+            "fileCount": input_files.len(),
+            "byteLength": total_input_bytes,
+        },
+        "features": {
+            "rawBuildings": raw_building_count,
+            "rawTerrainFeatures": raw_terrain_count,
+            "preparedBuildings": prepared_building_count,
+        },
+        "outputs": {
+            "buildingTiles": building_tile_count,
+            "terrainTiles": terrain_tile_count,
+            "totalTiles": building_tile_count + terrain_tile_count,
+            "buildingTriangles": building_triangle_count,
+            "terrainTriangles": terrain_triangle_count,
+            "totalTriangles": building_triangle_count + terrain_triangle_count,
+            "buildingGlbBytes": building_glb_byte_length,
+            "terrainGlbBytes": terrain_glb_byte_length,
+            "totalGlbBytes": building_glb_byte_length + terrain_glb_byte_length,
+            "sqliteBytes": database_byte_length,
+        },
+        "diagnostics": diagnostics,
+        "slowestInputFiles": slowest_input_files,
+        "largestInputFiles": largest_input_files,
+    })
+}
+
+fn top_stage_summary<'a>(
+    stage_elapsed_ms: &'a [(&'a str, u128)],
+    limit: usize,
+) -> Vec<(&'a str, u128)> {
+    let mut stages = stage_elapsed_ms.to_vec();
+    stages.sort_unstable_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    stages.truncate(limit);
+    stages
+}
+
+fn percentage_of_total(elapsed_ms: u128, total_elapsed_ms: u128) -> String {
+    let tenths_of_percent = elapsed_ms
+        .saturating_mul(1_000)
+        .checked_div(total_elapsed_ms)
+        .unwrap_or_default();
+    format!("{}.{:01}", tenths_of_percent / 10, tenths_of_percent % 10)
+}
+
+fn input_file_summary(
+    input_files: &[InputFileBreakdown],
+    mut compare: impl FnMut(&InputFileBreakdown, &InputFileBreakdown) -> std::cmp::Ordering,
+) -> Vec<serde_json::Value> {
+    let mut files = input_files.iter().collect::<Vec<_>>();
+    files.sort_unstable_by(|left, right| compare(left, right));
+    files
+        .into_iter()
+        .take(5)
+        .map(|file| {
+            json!({
+                "relativePath": file.relative_path,
+                "byteLength": file.byte_length,
+                "parsingElapsedMs": file.parsing_elapsed_ms,
+                "featureCount": file.raw_buildings + file.raw_terrain_features,
+                "rawBuildings": file.raw_buildings,
+                "rawTerrainFeatures": file.raw_terrain_features,
+                "terrainTextureDeclarations": file.terrain_texture_declarations,
+                "diagnostics": file.diagnostics,
+            })
+        })
+        .collect()
+}
+
 fn input_root(input: &Path) -> Result<&Path, Box<dyn std::error::Error>> {
     if input.is_file() {
         input.parent().ok_or("input file has no parent".into())
@@ -1608,6 +1759,94 @@ mod tests {
     }
 
     #[test]
+    fn conversion_summary_orders_bottlenecks_and_input_files_stably() {
+        let input_files = vec![
+            InputFileBreakdown {
+                relative_path: "z/slow.gml".to_owned(),
+                byte_length: 10,
+                parsing_elapsed_ms: 50,
+                raw_buildings: 1,
+                raw_terrain_features: 0,
+                terrain_texture_declarations: 0,
+                diagnostics: 0,
+            },
+            InputFileBreakdown {
+                relative_path: "a/slow.gml".to_owned(),
+                byte_length: 20,
+                parsing_elapsed_ms: 50,
+                raw_buildings: 0,
+                raw_terrain_features: 2,
+                terrain_texture_declarations: 1,
+                diagnostics: 3,
+            },
+            InputFileBreakdown {
+                relative_path: "middle.gml".to_owned(),
+                byte_length: 30,
+                parsing_elapsed_ms: 10,
+                raw_buildings: 0,
+                raw_terrain_features: 0,
+                terrain_texture_declarations: 0,
+                diagnostics: 0,
+            },
+        ];
+        let summary = conversion_summary(
+            200,
+            &[
+                ("sqliteWrite", 70),
+                ("parsingAndExtraction", 70),
+                ("manifestWrite", 5),
+            ],
+            &input_files,
+            1,
+            2,
+            1,
+            1,
+            1,
+            10,
+            20,
+            100,
+            200,
+            300,
+            3,
+        );
+
+        assert_eq!(summary["totalElapsedMs"], 200);
+        assert_eq!(summary["input"]["fileCount"], 3);
+        assert_eq!(summary["input"]["byteLength"], 60);
+        assert_eq!(summary["outputs"]["totalTriangles"], 30);
+        assert_eq!(summary["outputs"]["totalGlbBytes"], 300);
+        assert_eq!(summary["diagnostics"], 3);
+        assert_eq!(
+            summary["stageTimings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|stage| stage["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["parsingAndExtraction", "sqliteWrite", "manifestWrite"]
+        );
+        assert_eq!(
+            summary["slowestInputFiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["relativePath"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a/slow.gml", "z/slow.gml", "middle.gml"]
+        );
+        assert_eq!(
+            summary["largestInputFiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["relativePath"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["middle.gml", "a/slow.gml", "z/slow.gml"]
+        );
+        assert_eq!(summary["stageTimings"][0]["percentOfTotal"], "35.0");
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn converts_textured_tin_relief_to_independent_terrain_content() {
         let root =
@@ -1698,6 +1937,13 @@ mod tests {
             serde_json::from_slice(&fs::read(output.join("conversion.report.json")).unwrap())
                 .unwrap();
         assert!(conversion_report["totalElapsedMs"].is_u64());
+        let summary = &conversion_report["summary"];
+        assert_eq!(summary["input"]["fileCount"], 1);
+        assert_eq!(summary["features"]["rawBuildings"], 1);
+        assert_eq!(summary["outputs"]["buildingTiles"], 1);
+        assert!(summary["outputs"]["sqliteBytes"].as_u64().unwrap() > 0);
+        assert_eq!(summary["slowestInputFiles"].as_array().unwrap().len(), 1);
+        assert_eq!(summary["largestInputFiles"].as_array().unwrap().len(), 1);
         assert_eq!(conversion_report["stages"].as_object().unwrap().len(), 9);
         assert_eq!(
             conversion_report["stages"]["inputDiscoveryAndHashing"]["inputFiles"],
