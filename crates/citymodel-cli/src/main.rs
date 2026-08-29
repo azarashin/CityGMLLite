@@ -4,12 +4,15 @@
 mod metadata;
 
 use citymodel_citygml::{
-    AttributeValue, AxisOrder, BuildingAttribute, Diagnostic, InputLimits, ParserEvent,
-    discover_input_files, parse_file,
+    AttributeValue, AxisOrder, BuildingAttribute, Diagnostic, FeatureType, InputLimits,
+    ParserEvent, TerrainTexture as ParsedTerrainTexture, discover_input_files, parse_file,
 };
 use citymodel_coordinate::Point3;
 use citymodel_geometry::{Lod, Polygon, normalize_building_geometry};
-use citymodel_gltf::{TileGlbInput, write_tile_glb};
+use citymodel_gltf::{
+    TerrainGlbInput, TerrainTexture, TerrainTriangle, TileGlbInput, write_terrain_glb,
+    write_tile_glb,
+};
 use citymodel_spatialite::{BuildingRow, create_database, insert_building, verify_integrity};
 use citymodel_tiling::{DEFAULT_TILE_SIZE_METERS, TileId, tile_for_point};
 use rusqlite::params;
@@ -52,6 +55,34 @@ struct RawRing {
     dimension: usize,
     axis_order: AxisOrder,
     lod: u8,
+}
+#[derive(Clone, Debug)]
+struct RawTerrain {
+    id: String,
+    source_file_id: i64,
+    rings: Vec<RawTerrainRing>,
+}
+#[derive(Clone, Debug)]
+struct RawTerrainRing {
+    surface_id: String,
+    values: Vec<f64>,
+    dimension: usize,
+    axis_order: AxisOrder,
+}
+#[derive(Clone, Debug)]
+struct TerrainTileOutput {
+    id: String,
+    feature_assignments: Vec<(String, i64, u16)>,
+    glb_path: String,
+    metadata_path: String,
+    metadata_sha256: String,
+    metadata_byte_length: usize,
+    glb_sha256: String,
+    glb_byte_length: usize,
+    bounds: [f64; 4],
+    content_bounds: [f64; 6],
+    origin: Point3,
+    triangle_count: usize,
 }
 #[derive(Clone, Debug)]
 struct PreparedBuilding {
@@ -222,6 +253,7 @@ fn inspect(input: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn convert(
     input: &Path,
     output: &Path,
@@ -235,6 +267,8 @@ fn convert(
     let dataset_id = dataset_id(input);
     let generation_id = format!("gen-{}", &combined_digest(&files)[..16]);
     let mut buildings = Vec::new();
+    let mut terrain = Vec::new();
+    let mut terrain_textures = Vec::new();
     let mut source_files = Vec::new();
     let mut issues = Vec::new();
     for (index, file) in files.iter().enumerate() {
@@ -268,17 +302,39 @@ fn convert(
             fs::metadata(&file.path)?.len(),
         ));
         buildings.extend(extract_buildings(&report.events, source_file_id));
+        let (file_terrain, file_textures) = extract_terrain(&report.events, source_file_id);
+        terrain.extend(file_terrain);
+        terrain_textures.extend(file_textures);
     }
     let prepared = prepare_buildings(buildings, max_lod, mode, &mut issues)?;
-    if prepared.is_empty() {
-        return Err(format!("no building geometry was found at or below LOD{max_lod}").into());
-    }
     let (tile_outputs, assignments) = write_tiles(output, &generation_id, prepared)?;
+    let input_root = if input.is_file() {
+        input.parent().ok_or("input file has no parent")?
+    } else {
+        input
+    };
+    let terrain_outputs = write_terrain_tiles(
+        output,
+        &generation_id,
+        terrain,
+        terrain_textures,
+        input_root,
+    )?;
+    if tile_outputs.is_empty() && terrain_outputs.is_empty() {
+        return Err(format!(
+            "no building or textured terrain geometry was found at or below LOD{max_lod}"
+        )
+        .into());
+    }
     let origin = tile_outputs
         .iter()
         .map(|tile| tile.origin)
         .min_by(|left, right| left.x.total_cmp(&right.x).then(left.y.total_cmp(&right.y)))
-        .ok_or("no tiles")?;
+        .unwrap_or(Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        });
     let database_path = output.join("citymodel.sqlite");
     write_database(
         &database_path,
@@ -286,6 +342,7 @@ fn convert(
         &generation_id,
         &source_files,
         &tile_outputs,
+        &terrain_outputs,
         &assignments,
         &issues,
         origin,
@@ -297,6 +354,7 @@ fn convert(
         &generation_id,
         &source_files,
         &tile_outputs,
+        &terrain_outputs,
         origin,
         &database_sha256,
         max_lod,
@@ -304,7 +362,7 @@ fn convert(
     fs::write(
         output.join("conversion.report.json"),
         serde_json::to_vec_pretty(
-            &json!({"datasetId":dataset_id,"generationId":generation_id,"sourceFiles":source_files.len(),"buildings":assignments.len(),"tiles":tile_outputs.len(),"mode":format!("{mode:?}"),"maxLod":max_lod}),
+            &json!({"datasetId":dataset_id,"generationId":generation_id,"sourceFiles":source_files.len(),"buildings":assignments.len(),"terrainTiles":terrain_outputs.len(),"tiles":tile_outputs.len(),"mode":format!("{mode:?}"),"maxLod":max_lod}),
         )?,
     )?;
     Ok(())
@@ -325,6 +383,7 @@ fn extract_buildings(events: &[ParserEvent], source_file_id: i64) -> Vec<RawBuil
             ParserEvent::StartFeature {
                 gml_id,
                 is_building_part,
+                feature_type: FeatureType::Building,
             } => active.push(Active {
                 id: gml_id.clone(),
                 is_part: *is_building_part,
@@ -364,6 +423,131 @@ fn extract_buildings(events: &[ParserEvent], source_file_id: i64) -> Vec<RawBuil
         }
     }
     output
+}
+
+fn extract_terrain(
+    events: &[ParserEvent],
+    source_file_id: i64,
+) -> (Vec<RawTerrain>, Vec<ParsedTerrainTexture>) {
+    #[derive(Clone)]
+    struct Active {
+        id: String,
+        rings: Vec<RawTerrainRing>,
+    }
+    let mut active = Vec::<Active>::new();
+    let mut output = Vec::new();
+    let mut textures = Vec::new();
+    for event in events {
+        match event {
+            ParserEvent::StartFeature {
+                gml_id,
+                feature_type: FeatureType::Terrain,
+                ..
+            } => active.push(Active {
+                id: gml_id.clone(),
+                rings: Vec::new(),
+            }),
+            ParserEvent::Coordinates(sequence) if sequence.is_linear_ring => {
+                if let (Some(terrain), Some(surface_id)) = (active.last_mut(), &sequence.surface_id)
+                {
+                    terrain.rings.push(RawTerrainRing {
+                        surface_id: surface_id.clone(),
+                        values: sequence.values.clone(),
+                        dimension: usize::from(sequence.dimension.unwrap_or(3)),
+                        axis_order: sequence.axis_order,
+                    });
+                }
+            }
+            ParserEvent::TerrainTexture(texture) => textures.push(texture.clone()),
+            ParserEvent::EndFeature => {
+                if let Some(terrain) = active.pop() {
+                    output.push(RawTerrain {
+                        id: terrain.id,
+                        source_file_id,
+                        rings: terrain.rings,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (output, textures)
+}
+
+fn safe_texture_image(
+    input_root: &Path,
+    uri: &str,
+) -> Result<TerrainTexture, Box<dyn std::error::Error>> {
+    let value = Path::new(uri);
+    if uri.contains("://")
+        || value.is_absolute()
+        || value.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("unsafe terrain texture URI: {uri}").into());
+    }
+    let root = fs::canonicalize(input_root)?;
+    let candidate = fs::canonicalize(root.join(value))?;
+    if !candidate.starts_with(&root) {
+        return Err(format!("terrain texture escapes input root: {uri}").into());
+    }
+    let bytes = fs::read(candidate)?;
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("terrain texture exceeds 64 MiB limit".into());
+    }
+    let mime_type = image_mime_and_dimensions(&bytes)?;
+    Ok(TerrainTexture { mime_type, bytes })
+}
+
+fn image_mime_and_dimensions(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    const MAX_DIMENSION: u32 = 16_384;
+    if bytes.len() >= 24 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" && &bytes[12..16] == b"IHDR" {
+        let width = u32::from_be_bytes(bytes[16..20].try_into()?);
+        let height = u32::from_be_bytes(bytes[20..24].try_into()?);
+        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err("invalid PNG texture dimensions".into());
+        }
+        return Ok("image/png".to_owned());
+    }
+    if bytes.len() >= 4 && bytes[0] == 0xff && bytes[1] == 0xd8 {
+        let mut index = 2;
+        while index + 9 < bytes.len() {
+            if bytes[index] != 0xff {
+                index += 1;
+                continue;
+            }
+            let marker = bytes[index + 1];
+            index += 2;
+            if marker == 0xd9 || marker == 0xda {
+                break;
+            }
+            if index + 2 > bytes.len() {
+                break;
+            }
+            let length = usize::from(u16::from_be_bytes([bytes[index], bytes[index + 1]]));
+            if length < 2 || index + length > bytes.len() {
+                break;
+            }
+            if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf)
+                && length >= 7
+            {
+                let height = u32::from(u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]));
+                let width = u32::from(u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]));
+                if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+                    return Err("invalid JPEG texture dimensions".into());
+                }
+                return Ok("image/jpeg".to_owned());
+            }
+            index += length;
+        }
+    }
+    Err("terrain texture must be a PNG or JPEG with valid dimensions".into())
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -472,6 +656,224 @@ fn lod_from_u8(lod: u8) -> Option<Lod> {
 }
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn write_terrain_tiles(
+    output: &Path,
+    generation_id: &str,
+    terrain: Vec<RawTerrain>,
+    texture_declarations: Vec<ParsedTerrainTexture>,
+    input_root: &Path,
+) -> Result<Vec<TerrainTileOutput>, Box<dyn std::error::Error>> {
+    let textures_by_surface = texture_declarations
+        .into_iter()
+        .map(|texture| (texture.target_id.clone(), texture))
+        .collect::<BTreeMap<_, _>>();
+    let mut grouped =
+        BTreeMap::<TileId, Vec<(String, i64, RawTerrainRing, ParsedTerrainTexture)>>::new();
+    for feature in terrain {
+        for ring in feature.rings {
+            let Some(texture) = textures_by_surface.get(&ring.surface_id) else {
+                continue;
+            };
+            let Some(first) = ring.values.chunks(ring.dimension).next() else {
+                continue;
+            };
+            if first.len() < 2 {
+                continue;
+            }
+            let (north, east) = match ring.axis_order {
+                AxisOrder::EastNorthUp => (first[1], first[0]),
+                AxisOrder::NorthEastUp | AxisOrder::Unknown => (first[0], first[1]),
+            };
+            let point = web_mercator(east, north, first.get(2).copied().unwrap_or(0.0));
+            grouped
+                .entry(tile_for_point(point.x, point.y, DEFAULT_TILE_SIZE_METERS))
+                .or_default()
+                .push((
+                    feature.id.clone(),
+                    feature.source_file_id,
+                    ring,
+                    texture.clone(),
+                ));
+        }
+    }
+    let mut outputs = Vec::new();
+    for (grid, rings) in grouped {
+        let id = format!("t_{}_{}_{}", grid.level, grid.x, grid.y);
+        let origin = Point3 {
+            x: grid.x as f64 * DEFAULT_TILE_SIZE_METERS,
+            y: grid.y as f64 * DEFAULT_TILE_SIZE_METERS,
+            z: 0.0,
+        };
+        let mut feature_names = BTreeSet::new();
+        let mut loaded_textures = BTreeMap::<String, usize>::new();
+        let mut textures = Vec::new();
+        let mut source_triangles = Vec::<(String, i64, Vec<Point3>, Vec<(f64, f64)>, usize)>::new();
+        let mut feature_sources = BTreeMap::new();
+        for (feature_id, source_file_id, ring, texture) in rings {
+            let points = ring
+                .values
+                .chunks(ring.dimension)
+                .filter_map(|coordinate| {
+                    let (north, east) = match ring.axis_order {
+                        AxisOrder::EastNorthUp => (coordinate.get(1)?, coordinate.first()?),
+                        AxisOrder::NorthEastUp | AxisOrder::Unknown => {
+                            (coordinate.first()?, coordinate.get(1)?)
+                        }
+                    };
+                    Some(web_mercator(
+                        *east,
+                        *north,
+                        coordinate.get(2).copied().unwrap_or(0.0),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let mut points = points;
+            if points.first() == points.last() {
+                points.pop();
+            }
+            let mut uvs = texture.coordinates;
+            if uvs.len() > 1 && uvs.first() == uvs.last() {
+                uvs.pop();
+            }
+            if points.len() < 3 || points.len() != uvs.len() {
+                return Err(format!(
+                    "terrain surface {} has {} positions but {} UVs",
+                    ring.surface_id,
+                    points.len(),
+                    uvs.len()
+                )
+                .into());
+            }
+            let texture_index = if let Some(index) = loaded_textures.get(&texture.image_uri) {
+                *index
+            } else {
+                let image = safe_texture_image(input_root, &texture.image_uri)?;
+                let index = textures.len();
+                textures.push(image);
+                loaded_textures.insert(texture.image_uri, index);
+                index
+            };
+            feature_names.insert(feature_id.clone());
+            feature_sources.insert(feature_id.clone(), source_file_id);
+            source_triangles.push((feature_id, source_file_id, points, uvs, texture_index));
+        }
+        let feature_ids = feature_names
+            .into_iter()
+            .enumerate()
+            .map(|(index, feature_id)| Ok((feature_id, u16::try_from(index)?)))
+            .collect::<Result<BTreeMap<_, _>, std::num::TryFromIntError>>()?;
+        let mut triangles = Vec::new();
+        let mut content_bounds = [
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for (feature_id, _, points, uvs, texture_index) in source_triangles {
+            for index in 1..points.len() - 1 {
+                let positions = [points[0], points[index], points[index + 1]];
+                let mut local_positions = positions;
+                for point in &mut local_positions {
+                    content_bounds[0] = content_bounds[0].min(point.x);
+                    content_bounds[1] = content_bounds[1].min(point.y);
+                    content_bounds[2] = content_bounds[2].min(point.z);
+                    content_bounds[3] = content_bounds[3].max(point.x);
+                    content_bounds[4] = content_bounds[4].max(point.y);
+                    content_bounds[5] = content_bounds[5].max(point.z);
+                    *point = Point3 {
+                        x: point.x - origin.x,
+                        y: point.z,
+                        z: origin.y - point.y,
+                    };
+                }
+                triangles.push(TerrainTriangle {
+                    positions: local_positions,
+                    uvs: [uvs[0], uvs[index], uvs[index + 1]],
+                    feature_id: feature_id.clone(),
+                    texture_index,
+                });
+            }
+        }
+        let asset = write_terrain_glb(&TerrainGlbInput {
+            tile_id: id.clone(),
+            generation_id: generation_id.to_owned(),
+            triangles: triangles.clone(),
+            feature_ids: feature_ids.clone(),
+            textures,
+        })
+        .map_err(|error| format!("terrain GLB write failed: {error:?}"))?;
+        let glb_path = format!("terrain/{id}.glb");
+        let metadata_path = format!("terrain/{id}.meta.json");
+        let glb_output = output.join(&glb_path);
+        if let Some(parent) = glb_output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(glb_output, &asset.bytes)?;
+        let geographic = inverse_web_mercator(origin);
+        let metadata_feature_ids = feature_ids.keys().cloned().collect::<Vec<_>>();
+        let metadata_json = metadata::tile_metadata_json(&metadata::TileMetadataInput {
+            generation_id,
+            tile_id: &id,
+            glb_path: &glb_path,
+            glb_sha256: &asset.sha256,
+            glb_byte_length: u64::try_from(asset.bytes.len())?,
+            building_ids: &[],
+            feature_ids: &metadata_feature_ids,
+            feature_type: "terrain",
+            tile_bounds: [
+                origin.x,
+                origin.y,
+                origin.x + DEFAULT_TILE_SIZE_METERS,
+                origin.y + DEFAULT_TILE_SIZE_METERS,
+            ],
+            content_bounds,
+            projected_origin: [origin.x, origin.y, origin.z],
+            geographic_origin: [geographic.0, geographic.1, origin.z],
+            working_epsg: WORKING_EPSG,
+            vertex_count: triangles.len() * 3,
+            triangle_count: triangles.len(),
+        });
+        let metadata_output = metadata::write_json_under(output, &metadata_path, &metadata_json)?;
+        let metadata_byte_length = usize::try_from(fs::metadata(&metadata_output)?.len())
+            .map_err(|_| std::io::Error::other("terrain metadata exceeds supported size"))?;
+        let feature_assignments = feature_ids
+            .iter()
+            .map(|(feature_id, local_feature_id)| {
+                Ok((
+                    feature_id.clone(),
+                    *feature_sources
+                        .get(feature_id)
+                        .ok_or("missing terrain source file")?,
+                    *local_feature_id,
+                ))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        outputs.push(TerrainTileOutput {
+            id,
+            feature_assignments,
+            glb_path,
+            metadata_path,
+            metadata_sha256: sha256_file(&metadata_output)?,
+            metadata_byte_length,
+            glb_sha256: asset.sha256,
+            glb_byte_length: asset.bytes.len(),
+            bounds: [
+                origin.x,
+                origin.y,
+                origin.x + DEFAULT_TILE_SIZE_METERS,
+                origin.y + DEFAULT_TILE_SIZE_METERS,
+            ],
+            content_bounds,
+            origin,
+            triangle_count: triangles.len(),
+        });
+    }
+    Ok(outputs)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn write_tiles(
     output: &Path,
     generation_id: &str,
@@ -574,6 +976,7 @@ fn write_tiles(
             glb_sha256: &asset.sha256,
             glb_byte_length: asset.bytes.len() as u64,
             building_ids: &building_ids,
+            feature_ids: &building_ids,
             feature_type: "building",
             tile_bounds: bounds,
             content_bounds,
@@ -612,6 +1015,7 @@ fn write_database(
     generation_id: &str,
     source_files: &[(i64, PathBuf, String, u64)],
     tiles: &[TileOutput],
+    terrain_tiles: &[TerrainTileOutput],
     assignments: &[BuildingAssignment],
     issues: &[ConversionIssue],
     origin: Point3,
@@ -626,6 +1030,21 @@ fn write_database(
     for tile in tiles {
         connection.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.0, 0.0, 0.0, 4326, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, '[]', ?21, 0, ?22, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.building_ids.len() as i64, tile.triangle_count as i64])?;
         connection.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'building', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
+    }
+    for tile in terrain_tiles {
+        if !tiles
+            .iter()
+            .any(|building_tile| building_tile.id == tile.id)
+        {
+            let geographic = inverse_web_mercator(tile.origin);
+            connection.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 4326, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, '[]', 0, 0, ?24, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, geographic.0, geographic.1, tile.origin.z, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.triangle_count as i64])?;
+        }
+        connection.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'terrain', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
+        for (feature_id, source_file_id, local_feature_id) in &tile.feature_assignments {
+            let canonical = format!("{dataset_id}::{feature_id}");
+            connection.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'terrain', ?1, 'gml', 0, ?3)", params![feature_id, canonical, source_file_id])?;
+            connection.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'terrain', ?2, ?3)", params![tile.id, i64::from(*local_feature_id), feature_id])?;
+        }
     }
     for assignment in assignments {
         let canonical = format!("{dataset_id}::{}", assignment.building_id);
@@ -738,17 +1157,31 @@ fn write_manifest(
     generation_id: &str,
     source_files: &[(i64, PathBuf, String, u64)],
     tiles: &[TileOutput],
+    terrain_tiles: &[TerrainTileOutput],
     origin: Point3,
     database_sha256: &str,
     max_lod: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let geographic = inverse_web_mercator(origin);
     let input_files = source_files.iter().map(|(_, path, sha256, _)| json!({"path":path.file_name().and_then(|name| name.to_str()).unwrap_or("input.gml"),"sha256":sha256})).collect::<Vec<_>>();
-    let items = tiles
-        .iter()
-        .map(|tile| json!({"tileId":tile.id,"metadata":tile.metadata_path,"contents":[{"featureType":"building","metadata":tile.metadata_path,"sha256":tile.metadata_sha256,"byteLength":tile.metadata_byte_length}]}))
+    let mut contents = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for tile in tiles {
+        contents.entry(tile.id.clone()).or_default().push(json!({"featureType":"building","metadata":tile.metadata_path,"sha256":tile.metadata_sha256,"byteLength":tile.metadata_byte_length}));
+    }
+    for tile in terrain_tiles {
+        contents.entry(tile.id.clone()).or_default().push(json!({"featureType":"terrain","metadata":tile.metadata_path,"sha256":tile.metadata_sha256,"byteLength":tile.metadata_byte_length}));
+    }
+    let items = contents
+        .into_iter()
+        .map(|(tile_id, contents)| {
+            let metadata = contents
+                .first()
+                .and_then(|item| item["metadata"].as_str())
+                .unwrap_or_default();
+            json!({"tileId":tile_id,"metadata":metadata,"contents":contents})
+        })
         .collect::<Vec<_>>();
-    let manifest = json!({"schemaVersion":"1.0.0","datasetId":dataset_id,"generationId":generation_id,"generatedAt":"1970-01-01T00:00:00Z","generator":{"name":"citymodel","version":"0.1.0-dev"},"source":{"format":"CityGML","profile":"PLATEAU","citygmlVersion":"2.0","files":source_files.len(),"inputFiles":input_files,"conversionConfiguration":{"lod":max_lod,"maxLod":max_lod,"lodSelection":"highest-available-at-or-below-max-lod","tileSizeMetres":DEFAULT_TILE_SIZE_METERS,"workingCrs":"EPSG:3857"}},"coordinateReference":{"sourceCrs":{"epsg":6697,"wkt":null,"axisOrder":["latitude","longitude","height"]},"workingCrs":{"epsg":WORKING_EPSG,"wkt":null,"axisOrder":["easting","northing","height"],"unit":"metre"},"verticalReference":{"type":"source-defined","epsg":null,"geoidModel":null}},"datasetOrigin":{"geographic":{"latitude":geographic.0,"longitude":geographic.1,"height":origin.z,"epsg":4326},"projected":{"x":origin.x,"y":origin.y,"z":origin.z,"epsg":WORKING_EPSG}},"tiling":{"scheme":"projected-grid","defaultTileSizeMetres":DEFAULT_TILE_SIZE_METERS,"buildingAssignment":"representative-point","geometryClipping":false},"modelProfile":{"lod":max_lod,"textures":false,"compression":null,"featureIdSemantic":"_FEATURE_ID_0","featureIdComponentType":"UNSIGNED_SHORT"},"database":{"path":"citymodel.sqlite","sha256":database_sha256},"tiles":{"indexType":"inline","items":items}});
+    let manifest = json!({"schemaVersion":"1.0.0","datasetId":dataset_id,"generationId":generation_id,"generatedAt":"1970-01-01T00:00:00Z","generator":{"name":"citymodel","version":"0.1.0-dev"},"source":{"format":"CityGML","profile":"PLATEAU","citygmlVersion":"2.0","files":source_files.len(),"inputFiles":input_files,"conversionConfiguration":{"lod":max_lod,"maxLod":max_lod,"lodSelection":"highest-available-at-or-below-max-lod","tileSizeMetres":DEFAULT_TILE_SIZE_METERS,"workingCrs":"EPSG:3857"}},"coordinateReference":{"sourceCrs":{"epsg":6697,"wkt":null,"axisOrder":["latitude","longitude","height"]},"workingCrs":{"epsg":WORKING_EPSG,"wkt":null,"axisOrder":["easting","northing","height"],"unit":"metre"},"verticalReference":{"type":"source-defined","epsg":null,"geoidModel":null}},"datasetOrigin":{"geographic":{"latitude":geographic.0,"longitude":geographic.1,"height":origin.z,"epsg":4326},"projected":{"x":origin.x,"y":origin.y,"z":origin.z,"epsg":WORKING_EPSG}},"tiling":{"scheme":"projected-grid","defaultTileSizeMetres":DEFAULT_TILE_SIZE_METERS,"buildingAssignment":"representative-point","geometryClipping":false},"modelProfile":{"lod":max_lod,"textures":!terrain_tiles.is_empty(),"compression":null,"featureIdSemantic":"_FEATURE_ID_0","featureIdComponentType":"UNSIGNED_SHORT"},"database":{"path":"citymodel.sqlite","sha256":database_sha256},"tiles":{"indexType":"inline","items":items}});
     fs::write(
         output.join("dataset.manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -886,6 +1319,83 @@ mod tests {
         let (latitude, longitude) = inverse_web_mercator(point);
         assert!((latitude - 35.8).abs() < 0.000_001);
         assert!((longitude - 139.6).abs() < 0.000_001);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn converts_textured_tin_relief_to_independent_terrain_content() {
+        let root =
+            std::env::temp_dir().join(format!("citymodel-terrain-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let input = root.join("dataset");
+        fs::create_dir_all(input.join("udx/dem")).unwrap();
+        fs::create_dir_all(input.join("udx/bldg")).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../citymodel-citygml/tests/fixtures/plateau-lod1-small.gml"),
+            input.join("udx/bldg/building.gml"),
+        )
+        .unwrap();
+        let terrain_gml = input.join("udx/dem/terrain.gml");
+        fs::write(&terrain_gml, r##"<core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0" xmlns:dem="http://www.opengis.net/citygml/relief/2.0" xmlns:app="http://www.opengis.net/citygml/appearance/2.0" xmlns:gml="http://www.opengis.net/gml"><dem:ReliefFeature gml:id="terrain-1"><dem:reliefComponent><dem:TINRelief><gml:Triangle gml:id="surface-1"><gml:LinearRing gml:id="ring-1" srsName="urn:ogc:def:crs:EPSG::6697"><gml:posList>35 139 0 35 139.1 0 35.1 139 0 35 139 0</gml:posList></gml:LinearRing></gml:Triangle></dem:TINRelief></dem:reliefComponent></dem:ReliefFeature><app:ParameterizedTexture><app:imageURI>terrain.png</app:imageURI><app:target uri="#ring-1"><app:TexCoordList><app:textureCoordinates>0 0 1 0 0 1 0 0</app:textureCoordinates></app:TexCoordList></app:target></app:ParameterizedTexture></core:CityModel>"##).unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend(2_u32.to_be_bytes());
+        png.extend(2_u32.to_be_bytes());
+        png.extend([8, 2, 0, 0, 0]);
+        fs::write(input.join("terrain.png"), png).unwrap();
+        let output = root.join("output");
+        convert(&input, &output, Mode::Strict, 1).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("dataset.manifest.json")).unwrap())
+                .unwrap();
+        let contents = manifest["tiles"]["items"][0]["contents"]
+            .as_array()
+            .unwrap();
+        let terrain = contents
+            .iter()
+            .find(|content| content["featureType"] == "terrain")
+            .unwrap();
+        let metadata_path = terrain["metadata"].as_str().unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join(metadata_path)).unwrap()).unwrap();
+        assert_eq!(metadata["content"]["featureType"], "terrain");
+        assert_eq!(metadata["features"]["items"][0]["featureId"], "terrain-1");
+        let glb = fs::read(output.join(metadata["content"]["glb"].as_str().unwrap())).unwrap();
+        assert!(glb.windows(10).any(|value| value == b"TEXCOORD_0"));
+        assert!(glb.windows(9).any(|value| value == b"image/png"));
+        let database = rusqlite::Connection::open(output.join("citymodel.sqlite")).unwrap();
+        let mappings = database
+            .prepare("SELECT feature_type, local_feature_id, feature_id FROM feature_tile_mappings ORDER BY feature_type")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mappings,
+            vec![
+                ("building".to_owned(), 0, "sample-building-1".to_owned()),
+                ("terrain".to_owned(), 0, "terrain-1".to_owned())
+            ]
+        );
+        let content_types = database
+            .prepare("SELECT feature_type FROM tile_contents ORDER BY feature_type")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(content_types, vec!["building", "terrain"]);
+        drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_and_invalid_terrain_textures() {
+        let root = std::env::temp_dir();
+        assert!(safe_texture_image(&root, "../escape.png").is_err());
+        assert!(safe_texture_image(&root, "https://example.test/terrain.png").is_err());
+        assert!(image_mime_and_dimensions(b"not an image").is_err());
     }
 
     #[test]
