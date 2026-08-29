@@ -11,7 +11,13 @@ namespace CityModel.Database
 {
     public sealed class BuildingRecord { public string BuildingId; public string CanonicalBuildingId; public string TileId; }
     public sealed class BuildingAttribute { public string Key; public string Value; public string Unit; public string CodeSpace; }
+    /// <summary>A type-independent feature identity from the generated dataset.</summary>
+    public sealed class FeatureRecord { public string FeatureId; public string CanonicalFeatureId; public string FeatureType; }
+    /// <summary>A type-independent attribute value from the generated dataset.</summary>
+    public sealed class FeatureAttribute { public string Key; public string Value; public string Unit; public string CodeSpace; }
     public interface IReadOnlyBuildingStore : IDisposable { BuildingRecord FindBuilding(string buildingId); IReadOnlyList<BuildingAttribute> FindAttributes(string buildingId); }
+    /// <summary>Optional fixed-query extension implemented by v2 generated datasets.</summary>
+    public interface IReadOnlyFeatureStore : IDisposable { FeatureRecord FindFeature(string featureId); IReadOnlyList<FeatureAttribute> FindFeatureAttributes(string featureId); }
 
     /// <summary>Safe Unity-facing read-only database API. The native bridge supplies only prepared operations.</summary>
     public sealed class BuildingDatabase : IDisposable
@@ -34,6 +40,18 @@ namespace CityModel.Database
         }
         public Task<BuildingRecord> FindBuildingAsync(string buildingId, CancellationToken cancellationToken) => Task.Run(() => { ThrowIfDisposed(); return _store.FindBuilding(buildingId); }, cancellationToken);
         public Task<IReadOnlyList<BuildingAttribute>> FindAttributesAsync(string buildingId, CancellationToken cancellationToken) => Task.Run(() => { ThrowIfDisposed(); return _store.FindAttributes(buildingId); }, cancellationToken);
+        /// <summary>Looks up one feature through the v2 common feature table using a fixed read-only query.</summary>
+        public Task<FeatureRecord> FindFeatureAsync(string featureId, CancellationToken cancellationToken) => Task.Run(() =>
+        {
+            ThrowIfDisposed();
+            return GetFeatureStore().FindFeature(featureId);
+        }, cancellationToken);
+        /// <summary>Returns attributes for any feature type through a fixed read-only query.</summary>
+        public Task<IReadOnlyList<FeatureAttribute>> FindFeatureAttributesAsync(string featureId, CancellationToken cancellationToken) => Task.Run(() =>
+        {
+            ThrowIfDisposed();
+            return GetFeatureStore().FindFeatureAttributes(featureId);
+        }, cancellationToken);
         public void Dispose() { if (!_disposed) { _disposed = true; _store.Dispose(); } }
 
         private static BuildingDatabase OpenValidated(string datasetRoot, DatasetManifest manifest, CancellationToken cancellationToken)
@@ -96,5 +114,10 @@ namespace CityModel.Database
         }
 
         private void ThrowIfDisposed() { if (_disposed) throw new ObjectDisposedException(nameof(BuildingDatabase)); }
+        private IReadOnlyFeatureStore GetFeatureStore()
+        {
+            if (_store is IReadOnlyFeatureStore featureStore) return featureStore;
+            throw new NotSupportedException("The supplied read-only store does not support common feature queries.");
+        }
     }
 }
