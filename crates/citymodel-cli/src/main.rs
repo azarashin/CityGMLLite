@@ -5,7 +5,8 @@ mod metadata;
 
 use citymodel_citygml::{
     AttributeValue, AxisOrder, BuildingAttribute, Diagnostic, FeatureType, InputLimits,
-    ParserEvent, TerrainTexture as ParsedTerrainTexture, discover_input_files, parse_file,
+    ParserEvent, TerrainTexture as ParsedTerrainTexture, discover_input_files,
+    discover_input_paths, hash_input_file, parse_file,
 };
 use citymodel_coordinate::Point3;
 use citymodel_geometry::{Lod, Polygon, normalize_building_geometry};
@@ -287,33 +288,59 @@ fn convert(
     let total_started = Instant::now();
     let stage_started = Instant::now();
     status_stage_started("input discovery and hashing");
-    let files = discover_input_files(input).map_err(diagnostic_error)?;
-    if files.is_empty() {
+    let candidate_paths = discover_input_paths(input).map_err(diagnostic_error)?;
+    if candidate_paths.is_empty() {
         return Err("no CityGML files found".into());
     }
     let input_root = input_root(input)?;
-    let input_file_sizes = files
+    let input_file_sizes = candidate_paths
         .iter()
-        .map(|file| Ok((file.path.clone(), fs::metadata(&file.path)?.len())))
+        .map(|path| Ok((path.clone(), fs::metadata(path)?.len())))
         .collect::<Result<BTreeMap<_, _>, std::io::Error>>()?;
     let total_input_bytes = input_file_sizes.values().sum::<u64>();
     eprintln!(
-        "[citymodel] input files: {} ({} bytes)",
-        files.len(),
+        "[citymodel] input candidate discovery: finished ({} file(s), {} bytes)",
+        candidate_paths.len(),
         total_input_bytes
     );
-    for (index, file) in files.iter().enumerate() {
+    for (index, path) in candidate_paths.iter().enumerate() {
         let bytes = input_file_sizes
-            .get(&file.path)
+            .get(path)
             .copied()
             .ok_or("input file size missing")?;
         eprintln!(
             "[citymodel] input [{}/{}] {} ({} bytes)",
             index + 1,
-            files.len(),
-            input_relative_path(&file.path, input_root).display(),
+            candidate_paths.len(),
+            input_relative_path(path, input_root).display(),
             bytes
         );
+    }
+    let mut files = Vec::with_capacity(candidate_paths.len());
+    for (index, path) in candidate_paths.iter().enumerate() {
+        let bytes = input_file_sizes
+            .get(path)
+            .copied()
+            .ok_or("input file size missing")?;
+        let relative_path = input_relative_path(path, input_root);
+        let hash_started = Instant::now();
+        eprintln!(
+            "[citymodel] hashing [{}/{}] started: {} ({} bytes)",
+            index + 1,
+            candidate_paths.len(),
+            relative_path.display(),
+            bytes
+        );
+        let file = hash_input_file(path).map_err(diagnostic_error)?;
+        eprintln!(
+            "[citymodel] hashing [{}/{}] finished: {} ({} bytes; {} ms)",
+            index + 1,
+            candidate_paths.len(),
+            relative_path.display(),
+            bytes,
+            elapsed_ms(hash_started)
+        );
+        files.push(file);
     }
     let dataset_id = dataset_id(input);
     let generation_id = format!("gen-{}", &combined_digest(&files)[..16]);

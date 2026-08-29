@@ -178,15 +178,18 @@ pub struct ParseReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Finds `CityGML` files under a single file or a PLATEAU dataset's supported modules.
+/// Finds candidate `CityGML` paths under a single file or a PLATEAU dataset's supported modules.
+///
+/// This intentionally does not read the file contents. Call [`hash_input_file`]
+/// after discovery so callers can report progress while hashing large datasets.
 ///
 /// # Errors
 ///
 /// Returns an I/O diagnostic when the input cannot be read.
-pub fn discover_input_files(path: impl AsRef<Path>) -> Result<Vec<InputFile>, Diagnostic> {
+pub fn discover_input_paths(path: impl AsRef<Path>) -> Result<Vec<PathBuf>, Diagnostic> {
     let path = path.as_ref();
-    let files = if path.is_file() {
-        vec![path.to_path_buf()]
+    if path.is_file() {
+        Ok(vec![path.to_path_buf()])
     } else {
         let mut files = Vec::new();
         for module in ["bldg", "dem"] {
@@ -196,10 +199,29 @@ pub fn discover_input_files(path: impl AsRef<Path>) -> Result<Vec<InputFile>, Di
             }
         }
         files.sort();
-        files
-    };
+        Ok(files)
+    }
+}
 
-    files.into_iter().map(input_file).collect()
+/// Computes the stable source digest for one previously discovered input path.
+///
+/// # Errors
+///
+/// Returns an I/O diagnostic when the input cannot be read.
+pub fn hash_input_file(path: impl AsRef<Path>) -> Result<InputFile, Diagnostic> {
+    input_file(path.as_ref().to_path_buf())
+}
+
+/// Finds and hashes `CityGML` files under a single file or a PLATEAU dataset's supported modules.
+///
+/// # Errors
+///
+/// Returns an I/O diagnostic when the input cannot be read.
+pub fn discover_input_files(path: impl AsRef<Path>) -> Result<Vec<InputFile>, Diagnostic> {
+    discover_input_paths(path)?
+        .into_iter()
+        .map(input_file)
+        .collect()
 }
 
 /// Parses one selected `CityGML` file as an event stream.
@@ -942,6 +964,24 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         input_file(path).unwrap()
+    }
+
+    #[test]
+    fn discovers_candidates_before_hashing_them() {
+        let path = std::env::temp_dir().join(format!(
+            "citygml-candidate-{}-{}.gml",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let contents = b"candidate fixture";
+        File::create(&path).unwrap().write_all(contents).unwrap();
+
+        let candidates = discover_input_paths(&path).unwrap();
+        assert_eq!(candidates, vec![path.clone()]);
+
+        let input = hash_input_file(&candidates[0]).unwrap();
+        assert_eq!(input.path, path);
+        assert_eq!(input.sha256, hexadecimal_digest(Sha256::digest(contents)));
     }
 
     #[test]
