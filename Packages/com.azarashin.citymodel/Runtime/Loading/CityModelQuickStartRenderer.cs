@@ -20,12 +20,26 @@ namespace CityModel.Samples
         [Tooltip("Usage assigns stable categorical colors. Measured Height assigns a blue-to-red gradient across this dataset.")]
         [SerializeField] private BuildingAttributeColorMode attributeColorMode = BuildingAttributeColorMode.Usage;
 
+        [Tooltip("Each type can be loaded into memory independently. Initially Visible has no effect when Load On Startup is disabled.")]
+        [SerializeField] private CityModelFeatureTypeStartupSetting[] featureTypeStartupSettings =
+        {
+            new CityModelFeatureTypeStartupSetting
+            {
+                featureType = CityModelFeatureTypes.Building,
+                loadOnStartup = true,
+                initiallyVisible = true,
+            },
+        };
+
         private CityModelDataset _dataset;
         private CancellationTokenSource _cancellation;
         private GameObject _tilesRoot;
         private Material _material;
         private BuildingColorService _colors;
         private readonly List<Material> _tileMaterials = new List<Material>();
+        private readonly List<Mesh> _tileMeshes = new List<Mesh>();
+        private readonly Dictionary<string, GameObject> _typeRoots = new Dictionary<string, GameObject>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, List<MeshRenderer>> _typeRenderers = new Dictionary<string, List<MeshRenderer>>(StringComparer.OrdinalIgnoreCase);
 
         private async void Start()
         {
@@ -39,26 +53,108 @@ namespace CityModel.Samples
             try
             {
                 _dataset = await CityModelDataset.OpenAsync(datasetRoot, _cancellation.Token);
-                _tilesRoot = new GameObject("CityModel Tiles");
-                _tilesRoot.transform.SetParent(transform, false);
-                _material = CreateMaterial();
-                var loadedTiles = new List<LoadedTile>();
-                foreach (var tile in _dataset.Manifest.tiles.items)
+                var loadedContents = await LoadConfiguredContentsAsync(_cancellation.Token);
+                if (loadedContents.Count > 0) _material = CreateMaterial();
+                var loadedBuildings = new List<LoadedTile>();
+                foreach (var loadedContent in loadedContents)
+                    if (IsBuilding(loadedContent.FeatureType)) loadedBuildings.Add(loadedContent.Tile);
+
+                if (loadedBuildings.Count > 0)
                 {
-                    _cancellation.Token.ThrowIfCancellationRequested();
-                    loadedTiles.Add(await _dataset.LoadTileAsync(tile, _cancellation.Token));
+                    _colors = new BuildingColorService(BuildingAttributeColorizer.MissingAttributeColor);
+                    await ApplyAttributeColorsAsync(loadedBuildings, _cancellation.Token);
                 }
 
-                _colors = new BuildingColorService(BuildingAttributeColorizer.MissingAttributeColor);
-                await ApplyAttributeColorsAsync(loadedTiles, _cancellation.Token);
-                foreach (var tile in loadedTiles) CreateTile(tile);
+                foreach (var loadedContent in loadedContents)
+                    CreateTile(loadedContent.Tile, loadedContent.FeatureType, loadedContent.InitiallyVisible);
 
-                Debug.Log($"CityModel Quick Start: rendered {_dataset.Manifest.tiles.items.Length} tile(s).", this);
+                Debug.Log($"CityModel Quick Start: loaded {loadedContents.Count} content item(s).", this);
             }
             catch (Exception exception)
             {
                 Debug.LogException(exception, this);
             }
+        }
+
+        /// <summary>
+        /// Shows or hides a loaded feature type without decoding its artifacts again.
+        /// Returns false when that type was not loaded at startup.
+        /// </summary>
+        public bool SetFeatureTypeVisible(string featureType, bool visible)
+        {
+            if (string.IsNullOrWhiteSpace(featureType)) throw new ArgumentException("Feature type is required.", nameof(featureType));
+            if (!_typeRenderers.TryGetValue(featureType.Trim(), out var renderers)) return false;
+            foreach (var renderer in renderers)
+                if (renderer != null) renderer.enabled = visible;
+            return true;
+        }
+
+        /// <summary>Returns whether this type has instantiated render resources.</summary>
+        public bool IsFeatureTypeLoaded(string featureType)
+        {
+            return !string.IsNullOrWhiteSpace(featureType) && _typeRenderers.ContainsKey(featureType.Trim());
+        }
+
+        private async System.Threading.Tasks.Task<List<LoadedFeatureContent>> LoadConfiguredContentsAsync(CancellationToken cancellationToken)
+        {
+            var loadedContents = new List<LoadedFeatureContent>();
+            if (featureTypeStartupSettings == null || featureTypeStartupSettings.Length == 0)
+            {
+                // Scenes saved before the setting was introduced must keep loading their
+                // building-only artifacts even when Unity deserializes the new field as null.
+                foreach (var manifestTile in _dataset.Manifest.tiles.items)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    loadedContents.Add(new LoadedFeatureContent(
+                        CityModelFeatureTypes.Building,
+                        true,
+                        await _dataset.LoadTileAsync(manifestTile, cancellationToken)));
+                }
+                return loadedContents;
+            }
+
+            var configuredTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var setting in featureTypeStartupSettings)
+            {
+                if (setting == null || string.IsNullOrWhiteSpace(setting.featureType)) continue;
+                var featureType = setting.featureType.Trim();
+                if (!configuredTypes.Add(featureType)) continue;
+                if (!CityModelFeatureTypeStartupSettings.TryResolve(featureTypeStartupSettings, featureType, out var loadOnStartup, out var initiallyVisible) || !loadOnStartup)
+                    continue;
+
+                var contentIndexes = _dataset.GetContents(featureType);
+                if (contentIndexes.Length > 0)
+                {
+                    foreach (var manifestTile in _dataset.Manifest.tiles.items)
+                    {
+                        if (manifestTile.contents == null) continue;
+                        foreach (var content in manifestTile.contents)
+                        {
+                            if (content == null || !string.Equals(content.featureType, featureType, StringComparison.OrdinalIgnoreCase)) continue;
+                            cancellationToken.ThrowIfCancellationRequested();
+                            loadedContents.Add(new LoadedFeatureContent(
+                                featureType,
+                                initiallyVisible,
+                                await _dataset.LoadContentAsync(manifestTile, content, cancellationToken)));
+                        }
+                    }
+                }
+                else if (IsBuilding(featureType))
+                {
+                    // Pre-type-index artifacts only contain buildings. Preserve their existing
+                    // behaviour without allowing other unindexed types to trigger artifact I/O.
+                    foreach (var manifestTile in _dataset.Manifest.tiles.items)
+                    {
+                        if (manifestTile.contents != null) continue;
+                        cancellationToken.ThrowIfCancellationRequested();
+                        loadedContents.Add(new LoadedFeatureContent(
+                            CityModelFeatureTypes.Building,
+                            initiallyVisible,
+                            await _dataset.LoadTileAsync(manifestTile, cancellationToken)));
+                    }
+                }
+            }
+            return loadedContents;
         }
 
         private async System.Threading.Tasks.Task ApplyAttributeColorsAsync(IReadOnlyList<LoadedTile> loadedTiles, CancellationToken cancellationToken)
@@ -105,7 +201,7 @@ namespace CityModel.Samples
             }
         }
 
-        private void CreateTile(LoadedTile loadedTile)
+        private void CreateTile(LoadedTile loadedTile, string featureType, bool initiallyVisible)
         {
             var tileOrigin = loadedTile.Metadata.origin?.projected;
             var datasetOrigin = _dataset.Manifest.datasetOrigin?.projected;
@@ -113,24 +209,54 @@ namespace CityModel.Samples
                 throw new InvalidOperationException("Dataset or tile projected origin is missing.");
 
             var tile = new GameObject(loadedTile.Metadata.tileId);
-            tile.transform.SetParent(_tilesRoot.transform, false);
+            tile.transform.SetParent(GetOrCreateTypeRoot(featureType).transform, false);
             tile.transform.localPosition = new Vector3(
                 (float)(tileOrigin.x - datasetOrigin.x),
                 (float)(tileOrigin.z - datasetOrigin.z),
                 (float)(datasetOrigin.y - tileOrigin.y));
             var decoded = CityModelGlbDecoder.DecodeWithFeatureIds(loadedTile.GlbBytes, loadedTile.Metadata.tileId);
-            var buildingIds = loadedTile.Metadata.features?.buildingIds ?? Array.Empty<string>();
-            ValidateFeatureIds(decoded.FeatureIds, buildingIds, loadedTile.Metadata.tileId);
+            _tileMeshes.Add(decoded.Mesh);
             tile.AddComponent<MeshFilter>().sharedMesh = decoded.Mesh;
             var renderer = tile.AddComponent<MeshRenderer>();
-            _colors.RegisterTile(loadedTile.Metadata.tileId, buildingIds);
+            if (!_typeRenderers.TryGetValue(featureType, out var renderers))
+            {
+                renderers = new List<MeshRenderer>();
+                _typeRenderers.Add(featureType, renderers);
+            }
+            renderers.Add(renderer);
             var tileMaterial = new Material(_material)
             {
                 name = _material.name + " (" + loadedTile.Metadata.tileId + ")",
             };
-            _colors.ApplyToMaterial(loadedTile.Metadata.tileId, tileMaterial);
+            if (IsBuilding(featureType))
+            {
+                var buildingIds = loadedTile.Metadata.features?.buildingIds ?? Array.Empty<string>();
+                ValidateFeatureIds(decoded.FeatureIds, buildingIds, loadedTile.Metadata.tileId);
+                _colors.RegisterTile(loadedTile.Metadata.tileId, buildingIds);
+                _colors.ApplyToMaterial(loadedTile.Metadata.tileId, tileMaterial);
+            }
             renderer.sharedMaterial = tileMaterial;
+            renderer.enabled = initiallyVisible;
             _tileMaterials.Add(tileMaterial);
+        }
+
+        private GameObject GetOrCreateTypeRoot(string featureType)
+        {
+            if (_typeRoots.TryGetValue(featureType, out var typeRoot)) return typeRoot;
+            if (_tilesRoot == null)
+            {
+                _tilesRoot = new GameObject("CityModel Tiles");
+                _tilesRoot.transform.SetParent(transform, false);
+            }
+            typeRoot = new GameObject(featureType + " Tiles");
+            typeRoot.transform.SetParent(_tilesRoot.transform, false);
+            _typeRoots.Add(featureType, typeRoot);
+            return typeRoot;
+        }
+
+        private static bool IsBuilding(string featureType)
+        {
+            return string.Equals(featureType, CityModelFeatureTypes.Building, StringComparison.OrdinalIgnoreCase);
         }
 
         private static void ValidateFeatureIds(IReadOnlyList<ushort> featureIds, IReadOnlyList<string> buildingIds, string tileId)
@@ -157,8 +283,26 @@ namespace CityModel.Samples
             _colors?.Dispose();
             foreach (var tileMaterial in _tileMaterials) Destroy(tileMaterial);
             _tileMaterials.Clear();
+            foreach (var tileMesh in _tileMeshes) Destroy(tileMesh);
+            _tileMeshes.Clear();
+            _typeRenderers.Clear();
+            _typeRoots.Clear();
             if (_tilesRoot != null) Destroy(_tilesRoot);
             if (_material != null) Destroy(_material);
+        }
+
+        private sealed class LoadedFeatureContent
+        {
+            public LoadedFeatureContent(string featureType, bool initiallyVisible, LoadedTile tile)
+            {
+                FeatureType = featureType;
+                InitiallyVisible = initiallyVisible;
+                Tile = tile;
+            }
+
+            public string FeatureType { get; }
+            public bool InitiallyVisible { get; }
+            public LoadedTile Tile { get; }
         }
     }
 }

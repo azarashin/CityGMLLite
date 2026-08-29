@@ -15,12 +15,19 @@ directory's `package.json` file.
 3. Open `Assets/Samples/CityModel Runtime/0.1.0/Quick Start/QuickStart.unity`.
 4. Select **CityModel Quick Start**, set **Dataset Root** to the converter output
    directory, then enter Play mode.
-5. Choose **Attribute Color Mode**: **Usage** applies stable categorical colours,
-   while **Measured Height** applies a blue-to-red gradient over the dataset.
-   Missing attributes are rendered gray.
-6. Enter Play mode. The sample validates the manifest and each GLB, opens the
-   manifest-declared SQLite database read-only on Windows x64, and renders all
-   tiles with their Feature ID-to-building colour tables.
+5. Under **Feature Type Startup Settings**, add one entry for each desired
+   `featureType` (for example `building`, `terrain`, or `water`). Select
+   **Load On Startup** to read and instantiate that type, and select
+   **Initially Visible** to render it immediately. When loading is disabled,
+   the type's metadata, GLB, textures, and attributes are not opened.
+6. Choose **Attribute Color Mode** for loaded buildings: **Usage** applies
+   stable categorical colours, while **Measured Height** applies a blue-to-red
+   gradient over the dataset. Missing attributes are rendered gray.
+7. Enter Play mode. Loaded-but-hidden types retain their decoded meshes and can
+   be shown later without re-decoding by calling
+   `SetFeatureTypeVisible(featureType, true)`. The sample validates only the
+   selected content artifacts and opens the manifest-declared SQLite database
+   only when buildings are selected.
 
 `Dataset Root` must point at the converter output directory itself (the directory
 that contains `dataset.manifest.json` and `citymodel.sqlite`), not at an

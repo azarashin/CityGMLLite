@@ -37,7 +37,10 @@ cargo run -p citymodel-cli -- convert `
 
 Open `UnityProject/Assets/QuickStart.unity` in Unity 6.5.9f1, set **Dataset
 Root** on **CityModel Quick Start** to the generated directory, and enter Play
-mode. The sample verifies tile hashes and creates a Unity Mesh for every tile.
+mode. Under **Feature Type Startup Settings**, choose which generated
+`featureType` values to load and which of those begin visible. A type with
+**Load On Startup** disabled is not opened or instantiated; a loaded hidden type
+can be displayed later without decoding it again.
 
 The initial E2E path derives a Web Mercator (EPSG:3857) working plane from
 PLATEAU EPSG:6697/6668 geographic coordinates. It is intended for runtime
