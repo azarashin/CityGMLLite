@@ -97,7 +97,7 @@ struct TerrainMapTexture {
 #[derive(Clone, Debug)]
 struct TerrainTileOutput {
     id: String,
-    feature_assignments: Vec<(String, i64, u16)>,
+    feature_assignments: Vec<TerrainFeatureAssignment>,
     glb_path: String,
     metadata_path: String,
     metadata_sha256: String,
@@ -108,6 +108,13 @@ struct TerrainTileOutput {
     content_bounds: [f64; 6],
     origin: Point3,
     triangle_count: usize,
+}
+#[derive(Clone, Debug)]
+struct TerrainFeatureAssignment {
+    id: String,
+    gml: String,
+    source: i64,
+    local: u16,
 }
 #[derive(Clone, Debug)]
 struct PreparedBuilding {
@@ -776,6 +783,10 @@ fn extract_terrain(
     (output, textures)
 }
 
+fn terrain_feature_id(source_file_id: i64, gml_id: &str) -> String {
+    format!("terrain::{source_file_id}::{gml_id}")
+}
+
 fn geographic_envelope_from_file(
     path: &Path,
 ) -> Result<Option<GeographicEnvelope>, Box<dyn std::error::Error>> {
@@ -1194,7 +1205,7 @@ fn write_terrain_tiles(
     let mut fallback_by_source = BTreeMap::<i64, Result<TerrainMapTexture, String>>::new();
     let mut fallback_reported = BTreeSet::new();
     let mut grouped =
-        BTreeMap::<TileId, Vec<(String, i64, RawTerrainRing, ParsedTerrainTexture)>>::new();
+        BTreeMap::<TileId, Vec<(String, String, i64, RawTerrainRing, ParsedTerrainTexture)>>::new();
     for feature in terrain {
         for ring in feature.rings {
             let texture = if let Some(texture) =
@@ -1280,10 +1291,17 @@ fn write_terrain_tiles(
                 AxisOrder::NorthEastUp | AxisOrder::Unknown => (first[0], first[1]),
             };
             let point = web_mercator(east, north, first.get(2).copied().unwrap_or(0.0));
+            let feature_id = terrain_feature_id(feature.source_file_id, &feature.id);
             grouped
                 .entry(tile_for_point(point.x, point.y, DEFAULT_TILE_SIZE_METERS))
                 .or_default()
-                .push((feature.id.clone(), feature.source_file_id, ring, texture));
+                .push((
+                    feature_id,
+                    feature.id.clone(),
+                    feature.source_file_id,
+                    ring,
+                    texture,
+                ));
         }
     }
     let tile_count = grouped.len();
@@ -1300,7 +1318,8 @@ fn write_terrain_tiles(
         let mut textures = Vec::new();
         let mut source_triangles = Vec::<(String, i64, Vec<Point3>, Vec<(f64, f64)>, usize)>::new();
         let mut feature_sources = BTreeMap::new();
-        for (feature_id, source_file_id, ring, texture) in rings {
+        let mut feature_gml_ids = BTreeMap::new();
+        for (feature_id, gml_id, source_file_id, ring, texture) in rings {
             let points = ring
                 .values
                 .chunks(ring.dimension)
@@ -1346,6 +1365,7 @@ fn write_terrain_tiles(
             };
             feature_names.insert(feature_id.clone());
             feature_sources.insert(feature_id.clone(), source_file_id);
+            feature_gml_ids.insert(feature_id.clone(), gml_id);
             source_triangles.push((feature_id, source_file_id, points, uvs, texture_index));
         }
         let feature_ids = feature_names
@@ -1432,13 +1452,18 @@ fn write_terrain_tiles(
         let feature_assignments = feature_ids
             .iter()
             .map(|(feature_id, local_feature_id)| {
-                Ok((
-                    feature_id.clone(),
-                    *feature_sources
+                let source_file_id = *feature_sources
+                    .get(feature_id)
+                    .ok_or("missing terrain source file")?;
+                Ok(TerrainFeatureAssignment {
+                    id: feature_id.clone(),
+                    gml: feature_gml_ids
                         .get(feature_id)
-                        .ok_or("missing terrain source file")?,
-                    *local_feature_id,
-                ))
+                        .ok_or("missing terrain GML identifier")?
+                        .clone(),
+                    source: source_file_id,
+                    local: *local_feature_id,
+                })
             })
             .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         eprintln!(
@@ -1648,10 +1673,10 @@ fn write_database(
             transaction.execute("INSERT INTO tiles (tile_id, dataset_id, generation_id, glb_relative_path, metadata_relative_path, glb_sha256, glb_byte_length, origin_latitude, origin_longitude, origin_height, origin_geographic_epsg, origin_x, origin_y, origin_z, tile_min_x, tile_min_y, tile_max_x, tile_max_y, content_min_x, content_min_y, content_min_z, content_max_x, content_max_y, content_max_z, projected_to_local_matrix_json, building_count, vertex_count, triangle_count, primitive_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 4326, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, '[]', 0, 0, ?24, 1)", params![tile.id, dataset_id, generation_id, tile.glb_path, tile.metadata_path, tile.glb_sha256, tile.glb_byte_length as i64, geographic.0, geographic.1, tile.origin.z, tile.origin.x, tile.origin.y, tile.origin.z, tile.bounds[0], tile.bounds[1], tile.bounds[2], tile.bounds[3], tile.content_bounds[0], tile.content_bounds[1], tile.content_bounds[2], tile.content_bounds[3], tile.content_bounds[4], tile.content_bounds[5], tile.triangle_count as i64])?;
         }
         transaction.execute("INSERT INTO tile_contents (tile_id, feature_type, metadata_relative_path, metadata_sha256, metadata_byte_length, glb_relative_path, glb_sha256, glb_byte_length) VALUES (?1, 'terrain', ?2, ?3, ?4, ?5, ?6, ?7)", params![tile.id, tile.metadata_path, tile.metadata_sha256, tile.metadata_byte_length as i64, tile.glb_path, tile.glb_sha256, tile.glb_byte_length as i64])?;
-        for (feature_id, source_file_id, local_feature_id) in &tile.feature_assignments {
-            let canonical = format!("{dataset_id}::{feature_id}");
-            transaction.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'terrain', ?1, 'gml', 0, ?3)", params![feature_id, canonical, source_file_id])?;
-            transaction.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'terrain', ?2, ?3)", params![tile.id, i64::from(*local_feature_id), feature_id])?;
+        for assignment in &tile.feature_assignments {
+            let canonical = format!("{dataset_id}::{}", assignment.id);
+            transaction.execute("INSERT INTO features (feature_id, canonical_feature_id, feature_type, gml_id, id_source, id_is_synthetic, source_file_id) VALUES (?1, ?2, 'terrain', ?3, 'gml', 0, ?4) ON CONFLICT(feature_id) DO NOTHING", params![assignment.id, canonical, assignment.gml, assignment.source])?;
+            transaction.execute("INSERT INTO feature_tile_mappings (tile_id, feature_type, local_feature_id, feature_id) VALUES (?1, 'terrain', ?2, ?3)", params![tile.id, i64::from(assignment.local), assignment.id])?;
         }
     }
     for assignment in assignments {
@@ -2280,7 +2305,10 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join(metadata_path)).unwrap()).unwrap();
         assert_eq!(metadata["content"]["featureType"], "terrain");
-        assert_eq!(metadata["features"]["items"][0]["featureId"], "terrain-1");
+        assert_eq!(
+            metadata["features"]["items"][0]["featureId"],
+            "terrain::2::terrain-1"
+        );
         let glb = fs::read(output.join(metadata["content"]["glb"].as_str().unwrap())).unwrap();
         assert!(glb.windows(10).any(|value| value == b"TEXCOORD_0"));
         assert!(glb.windows(9).any(|value| value == b"image/png"));
@@ -2296,7 +2324,7 @@ mod tests {
             mappings,
             vec![
                 ("building".to_owned(), 0, "sample-building-1".to_owned()),
-                ("terrain".to_owned(), 0, "terrain-1".to_owned())
+                ("terrain".to_owned(), 0, "terrain::2::terrain-1".to_owned())
             ]
         );
         let content_types = database
@@ -2315,6 +2343,87 @@ mod tests {
             0
         );
         drop(database);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn namespaces_duplicate_terrain_ids_from_distinct_source_files() {
+        let root = std::env::temp_dir().join(format!(
+            "citymodel-terrain-id-collision-e2e-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let input = root.join("dataset");
+        let dem = input.join("udx/dem");
+        fs::create_dir_all(&dem).unwrap();
+        let terrain_gml = r##"<core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0" xmlns:dem="http://www.opengis.net/citygml/relief/2.0" xmlns:app="http://www.opengis.net/citygml/appearance/2.0" xmlns:gml="http://www.opengis.net/gml"><dem:ReliefFeature gml:id="terrain-1"><dem:reliefComponent><dem:TINRelief><gml:Triangle gml:id="surface-1"><gml:LinearRing gml:id="ring-1" srsName="urn:ogc:def:crs:EPSG::6697"><gml:posList>35 139 0 35 139.1 0 35.1 139 0 35 139 0</gml:posList></gml:LinearRing></gml:Triangle></dem:TINRelief></dem:reliefComponent></dem:ReliefFeature><app:ParameterizedTexture><app:imageURI>terrain.png</app:imageURI><app:target uri="#ring-1"><app:TexCoordList><app:textureCoordinates>0 0 1 0 0 1 0 0</app:textureCoordinates></app:TexCoordList></app:target></app:ParameterizedTexture></core:CityModel>"##;
+        fs::write(dem.join("terrain-a.gml"), terrain_gml).unwrap();
+        fs::write(dem.join("terrain-b.gml"), terrain_gml).unwrap();
+        fs::write(input.join("terrain.png"), tiny_png()).unwrap();
+        let output = root.join("output");
+
+        convert(&input, &output, Mode::Strict, 1).unwrap();
+
+        let database = rusqlite::Connection::open(output.join("citymodel.sqlite")).unwrap();
+        let features = database
+            .prepare("SELECT feature_id, canonical_feature_id, gml_id FROM features WHERE feature_type = 'terrain' ORDER BY feature_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(features.len(), 2);
+        assert_eq!(
+            features
+                .iter()
+                .map(|(_, _, gml_id)| gml_id)
+                .collect::<Vec<_>>(),
+            vec!["terrain-1", "terrain-1"]
+        );
+        assert!(
+            features
+                .iter()
+                .all(|(feature_id, canonical_feature_id, _)| {
+                    feature_id.starts_with("terrain::")
+                        && canonical_feature_id == &format!("dataset::{feature_id}")
+                })
+        );
+        assert_ne!(features[0].0, features[1].0);
+        drop(database);
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("dataset.manifest.json")).unwrap())
+                .unwrap();
+        let terrain = manifest["tiles"]["items"][0]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|content| content["featureType"] == "terrain")
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join(terrain["metadata"].as_str().unwrap())).unwrap(),
+        )
+        .unwrap();
+        let metadata_feature_ids = metadata["features"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["featureId"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(metadata_feature_ids.len(), 2);
+        assert!(
+            metadata_feature_ids
+                .iter()
+                .all(|feature_id| feature_id.starts_with("terrain::"))
+        );
+        let glb = fs::read(output.join(metadata["content"]["glb"].as_str().unwrap())).unwrap();
+        assert!(glb.windows(10).any(|value| value == b"TEXCOORD_0"));
         fs::remove_dir_all(root).unwrap();
     }
 
