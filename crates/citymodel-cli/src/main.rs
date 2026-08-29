@@ -25,6 +25,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Instant,
 };
 
 const WORKING_EPSG: u32 = 3857;
@@ -207,6 +208,18 @@ fn run(command: Command) -> ExitCode {
     }) {
         Ok(()) => {
             println!("conversion output: {}", output.display());
+            let report_path = output.join("conversion.report.json");
+            let total_elapsed_ms = fs::read(&report_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|report| report["totalElapsedMs"].as_u64());
+            match total_elapsed_ms {
+                Some(milliseconds) => println!(
+                    "conversion report: {} (total: {milliseconds} ms)",
+                    report_path.display()
+                ),
+                None => println!("conversion report: {}", report_path.display()),
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -260,17 +273,21 @@ fn convert(
     mode: Mode,
     max_lod: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let total_started = Instant::now();
+    let stage_started = Instant::now();
     let files = discover_input_files(input).map_err(diagnostic_error)?;
     if files.is_empty() {
         return Err("no CityGML files found".into());
     }
     let dataset_id = dataset_id(input);
     let generation_id = format!("gen-{}", &combined_digest(&files)[..16]);
+    let discovery_elapsed_ms = elapsed_ms(stage_started);
     let mut buildings = Vec::new();
     let mut terrain = Vec::new();
     let mut terrain_textures = Vec::new();
     let mut source_files = Vec::new();
     let mut issues = Vec::new();
+    let stage_started = Instant::now();
     for (index, file) in files.iter().enumerate() {
         let source_file_id = i64::try_from(index + 1).map_err(|_| "too many input files")?;
         let report = parse_file(file.clone(), InputLimits::default());
@@ -306,20 +323,39 @@ fn convert(
         terrain.extend(file_terrain);
         terrain_textures.extend(file_textures);
     }
-    let prepared = prepare_buildings(buildings, max_lod, mode, &mut issues)?;
-    let (tile_outputs, assignments) = write_tiles(output, &generation_id, prepared)?;
+    let parsing_elapsed_ms = elapsed_ms(stage_started);
+    let raw_building_count = buildings.len();
+    let raw_terrain_count = terrain.len();
+    let terrain_texture_declaration_count = terrain_textures.len();
+
+    let stage_started = Instant::now();
+    let prepared = prepare_buildings(buildings, max_lod, mode, &mut issues)
+        .map_err(|error| stage_error("building geometry preparation", error))?;
+    let building_triangle_count = prepared
+        .iter()
+        .map(|building| building.triangles.len())
+        .sum::<usize>();
+    let preparation_elapsed_ms = elapsed_ms(stage_started);
+
+    let stage_started = Instant::now();
+    let (tile_outputs, assignments) = write_tiles(output, &generation_id, prepared)
+        .map_err(|error| stage_error("building GLB tile write", error))?;
+    let building_glb_elapsed_ms = elapsed_ms(stage_started);
     let input_root = if input.is_file() {
         input.parent().ok_or("input file has no parent")?
     } else {
         input
     };
+    let stage_started = Instant::now();
     let terrain_outputs = write_terrain_tiles(
         output,
         &generation_id,
         terrain,
         terrain_textures,
         input_root,
-    )?;
+    )
+    .map_err(|error| stage_error("terrain GLB tile write", error))?;
+    let terrain_glb_elapsed_ms = elapsed_ms(stage_started);
     if tile_outputs.is_empty() && terrain_outputs.is_empty() {
         return Err(format!(
             "no building or textured terrain geometry was found at or below LOD{max_lod}"
@@ -336,6 +372,7 @@ fn convert(
             z: 0.0,
         });
     let database_path = output.join("citymodel.sqlite");
+    let stage_started = Instant::now();
     write_database(
         &database_path,
         &dataset_id,
@@ -346,8 +383,18 @@ fn convert(
         &assignments,
         &issues,
         origin,
-    )?;
-    let database_sha256 = sha256_file(&database_path)?;
+    )
+    .map_err(|error| stage_error("SQLite write", error))?;
+    let sqlite_write_elapsed_ms = elapsed_ms(stage_started);
+    let database_byte_length = fs::metadata(&database_path)?.len();
+    let database_row_counts = database_row_counts(&database_path)?;
+
+    let stage_started = Instant::now();
+    let database_sha256 =
+        sha256_file(&database_path).map_err(|error| stage_error("database hash", error))?;
+    let database_hash_elapsed_ms = elapsed_ms(stage_started);
+
+    let stage_started = Instant::now();
     write_manifest(
         output,
         &dataset_id,
@@ -358,12 +405,48 @@ fn convert(
         origin,
         &database_sha256,
         max_lod,
-    )?;
+    )
+    .map_err(|error| stage_error("manifest write", error))?;
+    let manifest_write_elapsed_ms = elapsed_ms(stage_started);
+
+    let building_glb_byte_length = tile_outputs
+        .iter()
+        .map(|tile| tile.glb_byte_length)
+        .sum::<usize>();
+    let terrain_glb_byte_length = terrain_outputs
+        .iter()
+        .map(|tile| tile.glb_byte_length)
+        .sum::<usize>();
+    let terrain_triangle_count = terrain_outputs
+        .iter()
+        .map(|tile| tile.triangle_count)
+        .sum::<usize>();
+    let report_started = Instant::now();
+    let report_path = output.join("conversion.report.json");
     fs::write(
-        output.join("conversion.report.json"),
-        serde_json::to_vec_pretty(
-            &json!({"datasetId":dataset_id,"generationId":generation_id,"sourceFiles":source_files.len(),"buildings":assignments.len(),"terrainTiles":terrain_outputs.len(),"tiles":tile_outputs.len(),"mode":format!("{mode:?}"),"maxLod":max_lod}),
-        )?,
+        &report_path,
+        serde_json::to_vec_pretty(&json!({
+            "datasetId":dataset_id,
+            "generationId":generation_id,
+            "sourceFiles":source_files.len(),
+            "buildings":assignments.len(),
+            "terrainTiles":terrain_outputs.len(),
+            "tiles":tile_outputs.len(),
+            "mode":format!("{mode:?}"),
+            "maxLod":max_lod,
+            "totalElapsedMs": elapsed_ms(total_started),
+            "stages": {
+                "inputDiscoveryAndHashing": {"elapsedMs": discovery_elapsed_ms, "inputFiles": files.len()},
+                "parsingAndExtraction": {"elapsedMs": parsing_elapsed_ms, "inputBytes": source_files.iter().map(|(_, _, _, length)| length).sum::<u64>(), "rawBuildings": raw_building_count, "rawTerrainFeatures": raw_terrain_count, "terrainTextureDeclarations": terrain_texture_declaration_count, "diagnostics": issues.len()},
+                "buildingGeometryPreparation": {"elapsedMs": preparation_elapsed_ms, "preparedBuildings": assignments.len(), "triangles": building_triangle_count},
+                "buildingGlbTiles": {"elapsedMs": building_glb_elapsed_ms, "tiles": tile_outputs.len(), "triangles": tile_outputs.iter().map(|tile| tile.triangle_count).sum::<usize>(), "glbBytes": building_glb_byte_length},
+                "terrainGlbTiles": {"elapsedMs": terrain_glb_elapsed_ms, "tiles": terrain_outputs.len(), "triangles": terrain_triangle_count, "glbBytes": terrain_glb_byte_length},
+                "sqliteWrite": {"elapsedMs": sqlite_write_elapsed_ms, "databaseBytes": database_byte_length, "rowCounts": database_row_counts},
+                "databaseHash": {"elapsedMs": database_hash_elapsed_ms, "databaseBytes": database_byte_length},
+                "manifestWrite": {"elapsedMs": manifest_write_elapsed_ms},
+                "reportWrite": {"elapsedMs": elapsed_ms(report_started)}
+            }
+        }))?,
     )?;
     Ok(())
 }
@@ -1214,6 +1297,44 @@ fn combined_digest(files: &[citymodel_citygml::InputFile]) -> String {
 fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     Ok(hex(Sha256::digest(fs::read(path)?)))
 }
+
+fn database_row_counts(
+    path: &Path,
+) -> Result<BTreeMap<&'static str, i64>, Box<dyn std::error::Error>> {
+    const TABLES: [&str; 10] = [
+        "source_files",
+        "tiles",
+        "tile_contents",
+        "buildings",
+        "building_attributes",
+        "features",
+        "feature_attributes",
+        "feature_tile_mappings",
+        "tile_features",
+        "conversion_issues",
+    ];
+    let connection = rusqlite::Connection::open(path)?;
+    TABLES
+        .into_iter()
+        .map(|table| {
+            let count =
+                connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            Ok((table, count))
+        })
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+        .map_err(Into::into)
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
+}
+
+fn stage_error(stage: &str, error: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    std::io::Error::other(format!("{stage} failed: {error}")).into()
+}
+
 fn hex(digest: impl IntoIterator<Item = u8>) -> String {
     digest.into_iter().fold(String::new(), |mut text, byte| {
         write!(text, "{byte:02x}").expect("writing to String cannot fail");
@@ -1407,6 +1528,40 @@ mod tests {
         let _ = fs::remove_dir_all(&output);
         fs::create_dir_all(&output).unwrap();
         convert(&fixture, &output, Mode::Strict, 1).unwrap();
+
+        let conversion_report: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("conversion.report.json")).unwrap())
+                .unwrap();
+        assert!(conversion_report["totalElapsedMs"].is_u64());
+        assert_eq!(conversion_report["stages"].as_object().unwrap().len(), 9);
+        assert_eq!(
+            conversion_report["stages"]["inputDiscoveryAndHashing"]["inputFiles"],
+            1
+        );
+        assert_eq!(
+            conversion_report["stages"]["parsingAndExtraction"]["rawBuildings"],
+            1
+        );
+        assert_eq!(
+            conversion_report["stages"]["buildingGeometryPreparation"]["preparedBuildings"],
+            1
+        );
+        assert!(
+            conversion_report["stages"]["buildingGlbTiles"]["glbBytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            conversion_report["stages"]["sqliteWrite"]["databaseBytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(
+            conversion_report["stages"]["sqliteWrite"]["rowCounts"]["buildings"],
+            1
+        );
 
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("dataset.manifest.json")).unwrap())
